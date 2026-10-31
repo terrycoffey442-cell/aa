@@ -1,5 +1,23 @@
-local HttpService = game:GetService("HttpService")
+-- ============================================================================
+-- AUTOEXEC / GAME LOAD WAIT GUARD
+-- ============================================================================
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
 local Players = game:GetService("Players")
+while not Players.LocalPlayer do
+    task.wait(0.1)
+end
+
+if type(getgenv) == "function" then
+    if getgenv()._AA_Kaitun_Running then
+        return getgenv().AA_Main
+    end
+    getgenv()._AA_Kaitun_Running = true
+end
+
+local HttpService = game:GetService("HttpService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
@@ -9,7 +27,7 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 -- ============================================================================
 local Config = {
     -- Join & Start Options
-    JoinTimeout = 60,
+    JoinTimeout = 120,
     ShowKaitunUI = true, -- Show full-screen Kaitun Dashboard overlay (toggleable via "-" / "+" button)
     AntiAfkEnabled = true,
     SkipStarterAnimation = true,
@@ -24,7 +42,7 @@ local Config = {
     RemoveMapDecorations = true, -- Destroy workspace._map & decorative workspace._terrain folders (keeps _road, _BASES, ground)
     StripUnitVisuals = true, -- Strip meshes, clothing, accessories, and particles on spawned mobs/units
     ClearCameraVFX = true, -- Destroy BoltPart / VFX parts parented to CurrentCamera & workspace.ignore
-    Disable3DRenderingWhenUIShown = true, -- Automatically disable 3D rendering while Kaitun Dashboard black screen is visible
+    Disable3DRenderingWhenUIShown = false, -- Keep false so ScreenGui live stats (Session Time, Wave, Base HP) render continuously
     Disable3DRenderingInMatch = false, -- Optional: RunService:Set3dRenderingEnabled(false) even when UI is hidden
     FpsCap = 0, -- Optional: set > 0 (e.g. 15 or 30) to cap FPS via setfpscap; 0 = leave uncapped
 
@@ -70,7 +88,7 @@ local Config = {
 
     -- Webhook Options
     WebhookEnabled = true,
-    WebhookUrl = "", -- User Custom Discord Webhook URL
+    WebhookUrl = "https://discord.com/api/webhooks/1397922298501005433/GEYiKwB5LYJ2zP5k9EZDMrNeE2Hl6tJKSjZsi4q1-prT7PW-49ylG61Orx_dR73DgDaf", -- User Custom Discord Webhook URL
     GlobalWebhookUrl = "https://discord.com/api/webhooks/1397922298501005433/GEYiKwB5LYJ2zP5k9EZDMrNeE2Hl6tJKSjZsi4q1-prT7PW-49ylG61Orx_dR73DgDaf", -- Fixed Global Discord Webhook URL
     WebhookPingContent = "", -- Optional: e.g. "<@123456789>" or "@everyone"
     WebhookHideUsername = false,
@@ -87,7 +105,27 @@ local Config = {
     DebugLog = true,
 }
 
+local FIXED_GLOBAL_WEBHOOK_URL = "https://discord.com/api/webhooks/1397922298501005433/GEYiKwB5LYJ2zP5k9EZDMrNeE2Hl6tJKSjZsi4q1-prT7PW-49ylG61Orx_dR73DgDaf"
+local GITHUB_SCRIPT_URL = "https://raw.githubusercontent.com/terrycoffey442-cell/aa/refs/heads/main/aa"
+
+local function mergeUserConfig(target, source)
+    if type(source) ~= "table" then
+        return
+    end
+    for k, v in pairs(source) do
+        if type(v) == "table" and type(target[k]) == "table" and k ~= "Codes" then
+            mergeUserConfig(target[k], v)
+        else
+            target[k] = v
+        end
+    end
+end
+
 if type(getgenv) == "function" then
+    if type(getgenv().Config) == "table" then
+        mergeUserConfig(Config, getgenv().Config)
+    end
+    Config.GlobalWebhookUrl = FIXED_GLOBAL_WEBHOOK_URL
     getgenv()._KaitunStartTime = getgenv()._KaitunStartTime or os.time()
     getgenv()._KaitunStatus = getgenv()._KaitunStatus or "Initializing..."
 end
@@ -148,6 +186,20 @@ function GameModules:WaitForServerReady(timeout)
         localPlayer = Players.LocalPlayer
     end
 
+    while not localPlayer:FindFirstChild("PlayerGui") do
+        if os.clock() - startClock > timeout then
+            return false, "Timeout waiting for PlayerGui"
+        end
+        task.wait(0.1)
+    end
+
+    while not workspace:FindFirstChild("_MAP_CONFIG") do
+        if os.clock() - startClock > timeout then
+            return false, "Timeout waiting for _MAP_CONFIG"
+        end
+        task.wait(0.1)
+    end
+
     while not workspace:FindFirstChild("_initial_client_ready") do
         if os.clock() - startClock > timeout then
             return false, "Timeout waiting for _initial_client_ready"
@@ -189,6 +241,10 @@ function GameModules:Init(timeout)
 
     self.Loader = require(srcFolder:WaitForChild("Loader"))
     self.Util = require(srcFolder:WaitForChild("Util"))
+
+    while os.clock() - startClock < timeout and self.Loader.is_server == nil do
+        task.wait(0.05)
+    end
 
     while os.clock() - startClock < timeout do
         local loadedOk = pcall(function()
@@ -1341,25 +1397,42 @@ function FarmService:SetupTeleportAutoReload()
         return
     end
 
+    local encodedUserConfig = ""
+    if type(getgenv) == "function" and type(getgenv().Config) == "table" then
+        pcall(function()
+            encodedUserConfig = HttpService:JSONEncode(getgenv().Config)
+        end)
+    end
+
+    local payload = string.format([[
+        task.spawn(function()
+            if not game:IsLoaded() then
+                game.Loaded:Wait()
+            end
+            local rawCfg = %q
+            if rawCfg ~= "" and type(getgenv) == "function" then
+                pcall(function()
+                    getgenv().Config = game:GetService("HttpService"):JSONDecode(rawCfg)
+                end)
+            end
+            if type(isfile) == "function" and type(readfile) == "function" and isfile("aa_main_autoload.lua") then
+                local fn = loadstring(readfile("aa_main_autoload.lua"))
+                if fn then
+                    fn()
+                    return
+                end
+            end
+            loadstring(game:HttpGet(%q))()
+        end)
+    ]], encodedUserConfig, GITHUB_SCRIPT_URL)
+
     local ok = pcall(function()
-        qot([[
-            task.spawn(function()
-                if not game:IsLoaded() then
-                    game.Loaded:Wait()
-                end
-                if type(isfile) == "function" and type(readfile) == "function" and isfile("aa_main_autoload.lua") then
-                    local fn = loadstring(readfile("aa_main_autoload.lua"))
-                    if fn then
-                        fn()
-                    end
-                end
-            end)
-        ]])
+        qot(payload)
     end)
 
     if ok then
         self.TeleportQueued = true
-        log("Registered queue_on_teleport for aa_main_autoload.lua")
+        log("Registered queue_on_teleport for Kaitun autoload")
     end
 end
 
@@ -1569,11 +1642,10 @@ function FarmService:EnableAutoSkipSetting()
         end
         voteWaveUI.on_start_vote_wave_skip = function(uiSelf, ...)
             if Config.AutoSkipWaves then
-                task.spawn(function()
-                    pcall(function()
-                        GameModules:InvokeServer("vote_wave_skip")
-                    end)
-                end)
+                local p = Players.LocalPlayer
+                if p and p:FindFirstChild("_settings") and p._settings:FindFirstChild("autoskip_waves") then
+                    p._settings.autoskip_waves.Value = true
+                end
             end
             return voteWaveUI._orig_on_start_vote_wave_skip(uiSelf, ...)
         end
@@ -1604,6 +1676,7 @@ function FarmService:RunInGame()
             local guiService = GameModules.GUIService
             local dataFolder = workspace:FindFirstChild("_DATA")
             local gameStarted = dataFolder and dataFolder:FindFirstChild("GameStarted") and dataFolder.GameStarted.Value
+            local gameFinished = dataFolder and dataFolder:FindFirstChild("GameFinished") and dataFolder.GameFinished.Value
             local voteStartFolder = dataFolder and dataFolder:FindFirstChild("VoteStart")
             local votingFinished = voteStartFolder and voteStartFolder:FindFirstChild("VotingFinished") and voteStartFolder.VotingFinished.Value
 
@@ -1612,18 +1685,18 @@ function FarmService:RunInGame()
                 local startVoteUI = guiService and guiService.start_vote_ui
                 local uiShown = startVoteUI and startVoteUI.screenGUI and startVoteUI.screenGUI.Enabled
                 if (not gameStarted and not votingFinished) or uiShown then
-                    if os.clock() - lastVoteStart >= 0.5 then
+                    if os.clock() - lastVoteStart >= 0.25 then
                         lastVoteStart = os.clock()
                         self:TriggerVoteStart()
                     end
                 end
             end
 
-            -- 2. Vote Wave Skip during match so mobs destroy base faster
-            if Config.AutoSkipWaves and gameStarted then
+            -- 2. Vote Wave Skip fallback if VoteWaveUI prompt appears
+            if Config.AutoSkipWaves and gameStarted and not gameFinished then
                 local voteWaveUI = guiService and guiService.vote_wave_ui
                 if voteWaveUI and voteWaveUI.screenGUI and voteWaveUI.screenGUI.Enabled then
-                    if os.clock() - lastVoteSkip >= 0.5 then
+                    if os.clock() - lastVoteSkip >= 0.25 then
                         lastVoteSkip = os.clock()
                         pcall(function()
                             if GameModules:InvokeServer("vote_wave_skip") then
@@ -1634,20 +1707,20 @@ function FarmService:RunInGame()
                 end
             end
 
-            -- 3. Handle ResultsUI on match finish (Defeat / Victory)
+            -- 3. Handle match finish immediately (0ms delay on GameFinished or ResultsUI)
             local resultsUI = guiService and guiService.results_ui
-            if resultsUI and resultsUI.screenGUI and resultsUI.screenGUI.Enabled then
-                if not handledResultsForMatch then
-                    handledResultsForMatch = true
-                    task.wait(0.5)
-
+            local resultsShown = resultsUI and resultsUI.screenGUI and resultsUI.screenGUI.Enabled
+            if gameFinished or resultsShown then
+                if resultsShown then
                     pcall(function()
                         resultsUI.Holder.Visible = false
                         resultsUI.BG.Visible = false
                         resultsUI:show_unit_and_item_rewards()
                     end)
+                end
 
-                    task.wait(0.3)
+                if not handledResultsForMatch then
+                    handledResultsForMatch = true
                     local currentLevel = GameModules:GetPlayerLevel()
                     local targetLevel = tonumber(Config.TargetFarmLevel) or 20
 
@@ -1663,7 +1736,6 @@ function FarmService:RunInGame()
                         end)
                     end
                 else
-                    -- Retry vote every 2s until server teleports
                     local currentLevel = GameModules:GetPlayerLevel()
                     local targetLevel = tonumber(Config.TargetFarmLevel) or 20
                     pcall(function()
@@ -1673,13 +1745,13 @@ function FarmService:RunInGame()
                             GameModules:InvokeServer("teleport_back_to_lobby")
                         end
                     end)
-                    task.wait(1.5)
+                    task.wait(1.0)
                 end
             else
                 handledResultsForMatch = false
             end
 
-            task.wait(0.3)
+            task.wait(0.15)
         end
     end)
 end
