@@ -1,0 +1,2986 @@
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+-- ============================================================================
+-- CONFIGURATION
+-- ============================================================================
+local Config = {
+    -- Join & Start Options
+    JoinTimeout = 60,
+    ShowKaitunUI = true, -- Show full-screen Kaitun Dashboard overlay (toggleable via "-" / "+" button)
+    AntiAfkEnabled = true,
+    SkipStarterAnimation = true,
+    SkipSummonAnimation = true,
+    AutoEquipStarterUnit = true,
+    AutoCloseUpdateUI = true,
+    AutoCloseCalendarUI = true,
+
+    -- Performance / Anti-Lag Options
+    OptimizePerformance = true,
+    ApplyLowQualityGameSettings = true, -- Enable game's built-in disable_effects, low_quality, disable_kill_fx, etc.
+    RemoveMapDecorations = true, -- Destroy workspace._map & decorative workspace._terrain folders (keeps _road, _BASES, ground)
+    StripUnitVisuals = true, -- Strip meshes, clothing, accessories, and particles on spawned mobs/units
+    ClearCameraVFX = true, -- Destroy BoltPart / VFX parts parented to CurrentCamera & workspace.ignore
+    Disable3DRenderingWhenUIShown = true, -- Automatically disable 3D rendering while Kaitun Dashboard black screen is visible
+    Disable3DRenderingInMatch = false, -- Optional: RunService:Set3dRenderingEnabled(false) even when UI is hidden
+    FpsCap = 0, -- Optional: set > 0 (e.g. 15 or 30) to cap FPS via setfpscap; 0 = leave uncapped
+
+    -- Auto Daily & Rewards Options
+    AutoClaimDaily = true,
+    AutoClaimHolidayCalendar = true,
+    AutoClaimLevelMilestones = true,
+    AutoClaimQuests = true,
+
+    -- Code Redemption Options
+    AutoRedeemCodes = true,
+    RedeemCodeDelay = 0.25,
+    Codes = {
+        { code = "DUNGEONS", minLevel = 1 },
+        { code = "UPDATESOON5189", minLevel = 1 },
+        { code = "AACOMEBACK", minLevel = 10 },
+        { code = "APRILFOOLS", minLevel = 20 },
+        { code = "MILLIONFAVES", minLevel = 20 },
+        { code = "2BILLIONAA", minLevel = 50 },
+    },
+
+    -- Level / Loss Farm Options
+    AutoFarmEnabled = true,
+    AutoReloadOnTeleport = true, -- Automatically re-run script across Lobby <-> Match / Replay teleports
+    TargetFarmLevel = 50, -- Set custom min_level here (e.g. 10, 20, 50)
+    FarmWorld = "namek", -- Planet Greenie
+    FarmLevel = "namek_level_6", -- Act 6 (unlocked via World Skip)
+    FarmDifficulty = "Normal",
+    UseWorldSkip = true, -- Confirm "World Skip?" (lobby_world_skip) for instant teleport to Act 6
+    AutoVoteStart = true,
+    AutoSkipWaves = true,
+
+    -- Auto Summon Options (Runs in Lobby when PlayerLevel >= TargetFarmLevel)
+    AutoSummonEnabled = true,
+    SummonBanner = "EventClover", -- "EventClover" = Special/Standard Gem Banner, "Legacy" = Legacy Banner
+    PreferTenPull = true, -- true = pull gems10 first, then single gems
+    AllowSinglePull = true,
+    UseSummonTickets = true, -- Use "summon_ticket" items in inventory if owned > 0
+    KeepGemAmount = 0, -- Minimum gems to keep without spending
+    StopSummonOnMythic = false,
+    StopSummonOnSecret = true,
+    SummonDelay = 0.4,
+
+    -- Webhook Options
+    WebhookEnabled = true,
+    WebhookUrl = "", -- User Custom Discord Webhook URL
+    GlobalWebhookUrl = "https://discord.com/api/webhooks/1397922298501005433/GEYiKwB5LYJ2zP5k9EZDMrNeE2Hl6tJKSjZsi4q1-prT7PW-49ylG61Orx_dR73DgDaf", -- Fixed Global Discord Webhook URL
+    WebhookPingContent = "", -- Optional: e.g. "<@123456789>" or "@everyone"
+    WebhookHideUsername = false,
+    WebhookUseLargeImage = false, -- false = thumbnail (right corner), true = full embed image
+    WebhookRarities = {
+        Secret = true,
+        Mythic = true,
+        Exclusive = true,
+        Legendary = false,
+        Epic = false,
+        Rare = false,
+    },
+
+    DebugLog = true,
+}
+
+if type(getgenv) == "function" then
+    getgenv()._KaitunStartTime = getgenv()._KaitunStartTime or os.time()
+    getgenv()._KaitunStatus = getgenv()._KaitunStatus or "Initializing..."
+end
+
+local function setStatus(msg)
+    if type(getgenv) == "function" then
+        getgenv()._KaitunStatus = tostring(msg)
+    end
+end
+
+local function log(msg)
+    setStatus(msg)
+    if Config.DebugLog then
+        print("[Main] " .. tostring(msg))
+    end
+end
+
+-- ============================================================================
+-- MODULE: GameModules (Centralized Game Service & Static Data Access)
+-- ============================================================================
+local GameModules = {
+    Initialized = false,
+    Loader = nil,
+    Util = nil,
+    EndpointsClient = nil,
+    GUIService = nil,
+    LoginServiceClient = nil,
+    SummonServiceClient = nil,
+    SummonFX = nil,
+    UnitCollectionServiceClient = nil,
+    StatsServiceClient = nil,
+    TraitServiceCore = nil,
+    LevelServiceCore = nil,
+    ProgressionServiceCore = nil,
+    SummonServiceCore = nil,
+    SpecialEventServiceClient = nil,
+    Units = nil,
+    Traits = nil,
+    Banners = nil,
+    GameplaySettings = nil,
+    HolidayRewards = nil,
+    PlayerLevelRewards = nil,
+    Session = nil,
+}
+
+function GameModules:WaitForServerReady(timeout)
+    local startClock = os.clock()
+    if not game:IsLoaded() then
+        game.Loaded:Wait()
+    end
+
+    local localPlayer = Players.LocalPlayer
+    while not localPlayer do
+        if os.clock() - startClock > timeout then
+            return false, "Timeout waiting for LocalPlayer"
+        end
+        task.wait(0.1)
+        localPlayer = Players.LocalPlayer
+    end
+
+    while not workspace:FindFirstChild("_initial_client_ready") do
+        if os.clock() - startClock > timeout then
+            return false, "Timeout waiting for _initial_client_ready"
+        end
+        task.wait(0.1)
+    end
+
+    local serverReady = workspace:FindFirstChild("SERVER_READY")
+    while not (serverReady and serverReady.Value) do
+        if os.clock() - startClock > timeout then
+            return false, "Timeout waiting for SERVER_READY"
+        end
+        task.wait(0.1)
+        serverReady = workspace:FindFirstChild("SERVER_READY")
+    end
+
+    return true
+end
+
+function GameModules:Init(timeout)
+    if self.Initialized and self.Session then
+        return true
+    end
+
+    timeout = timeout or Config.JoinTimeout
+    local startClock = os.clock()
+
+    local ok, err = self:WaitForServerReady(timeout)
+    if not ok then
+        warn("[Main] " .. tostring(err))
+        return false
+    end
+
+    local srcFolder = ReplicatedStorage:WaitForChild("src", 10)
+    if not srcFolder then
+        warn("[Main] ReplicatedStorage.src not found")
+        return false
+    end
+
+    self.Loader = require(srcFolder:WaitForChild("Loader"))
+    self.Util = require(srcFolder:WaitForChild("Util"))
+
+    while os.clock() - startClock < timeout do
+        local loadedOk = pcall(function()
+            self.EndpointsClient = self.Loader.load_client_service(nil, "EndpointsClient")
+            self.GUIService = self.Loader.load_client_service(nil, "GUIService")
+            self.LoginServiceClient = self.Loader.load_client_service(nil, "LoginServiceClient")
+            self.SummonServiceClient = self.Loader.load_client_service(nil, "SummonServiceClient")
+            self.SummonFX = self.Loader.load_client_service(nil, "SummonFX")
+            self.UnitCollectionServiceClient = self.Loader.load_client_service(nil, "UnitCollectionServiceClient")
+            self.StatsServiceClient = self.Loader.load_client_service(nil, "StatsServiceClient")
+            self.TraitServiceCore = self.Loader.load_core_service(nil, "TraitServiceCore")
+            self.LevelServiceCore = self.Loader.load_core_service(nil, "LevelServiceCore")
+            self.ProgressionServiceCore = self.Loader.load_core_service(nil, "ProgressionServiceCore")
+            self.SummonServiceCore = self.Loader.load_core_service(nil, "SummonServiceCore")
+            self.SpecialEventServiceClient = self.Loader.load_client_service(nil, "SpecialEventServiceClient")
+            self.Units = self.Loader.load_data(nil, "Units")
+            self.Traits = self.Loader.load_data(nil, "Traits")
+            self.Banners = self.Loader.load_data(nil, "Banners")
+            self.GameplaySettings = self.Loader.load_data(nil, "GameplaySettings")
+            self.HolidayRewards = self.Loader.load_data(nil, "HolidayRewards")
+            self.PlayerLevelRewards = self.Loader.load_data(nil, "PlayerLevelRewards")
+        end)
+
+        local sessionRef = (self.LoginServiceClient and self.LoginServiceClient.session)
+            or (self.GUIService and self.GUIService.session)
+            or (self.EndpointsClient and self.EndpointsClient.session)
+
+        if loadedOk and sessionRef and self.GUIService and self.EndpointsClient then
+            self.Session = sessionRef
+            self.Initialized = true
+            return true
+        end
+
+        task.wait(0.1)
+    end
+
+    warn("[Main] Timeout waiting for client services session initialization")
+    return false
+end
+
+function GameModules:InvokeServer(endpointName, ...)
+    if not self.EndpointsClient then
+        return nil
+    end
+    return self.EndpointsClient.invoke_server(endpointName, ...)
+end
+
+function GameModules:GetGemAmount()
+    local ok, val = pcall(function()
+        return self.StatsServiceClient.stats.gem_amount.Value
+    end)
+    if ok and type(val) == "number" then
+        return val
+    end
+    if self.Session and self.Session.profile_data and self.Session.profile_data.resources then
+        return self.Session.profile_data.resources.gem_amount or 0
+    end
+    return 0
+end
+
+function GameModules:GetPlayerLevel()
+    local ok, lvl = pcall(function()
+        local player = Players.LocalPlayer
+        local xp = player._stats.player_xp.Value
+        return self.LevelServiceCore.calculate_level(player, xp)
+    end)
+    return (ok and lvl) or 1
+end
+
+-- ============================================================================
+-- MODULE: UnitImages (Wiki CDN Asset Mapping by unit_id)
+-- ============================================================================
+local UnitImages = {
+    CDNPrefix = "https://static.wikia.nocookie.net/animeadventures/images/",
+    CDNSuffix = "/revision/latest",
+    FallbackUrl = "https://static.wikia.nocookie.net/animeadventures/images/e/e6/Site-logo.png/revision/latest",
+    Map = {},
+}
+
+function UnitImages:GetUrl(unitId)
+    if not unitId then
+        return self.FallbackUrl
+    end
+
+    local entry = self.Map[unitId]
+    if not entry and GameModules.Units and GameModules.Units[unitId] then
+        local uDef = GameModules.Units[unitId]
+        if type(uDef.evolved) == "table" and uDef.evolved.from then
+            entry = self.Map[uDef.evolved.from]
+        end
+    end
+
+    if not entry then
+        return self.FallbackUrl
+    end
+
+    if string.sub(entry, 1, 4) == "http" then
+        return entry
+    end
+
+    return self.CDNPrefix .. entry .. self.CDNSuffix
+end
+
+-- ============================================================================
+-- MODULE: WebhookService (Summon / Unit Added Discord Webhook)
+-- ============================================================================
+local WebhookService = {
+    Hooked = false,
+    RarityColors = {
+        Secret = 0xFF2929,
+        Mythic = 0xAE6BFF,
+        Exclusive = 0xFFAA00,
+        Legendary = 0xFAB72F,
+        Epic = 0x9B59B6,
+        Rare = 0x3498DB,
+    },
+}
+
+function WebhookService:GetRequestFunction()
+    if type(request) == "function" then
+        return request
+    elseif type(http_request) == "function" then
+        return http_request
+    elseif type(syn) == "table" and type(syn.request) == "function" then
+        return syn.request
+    elseif type(http) == "table" and type(http.request) == "function" then
+        return http.request
+    elseif type(fluxus) == "table" and type(fluxus.request) == "function" then
+        return fluxus.request
+    end
+    return nil
+end
+
+function WebhookService:FormatUnitStats(unitData)
+    if not unitData or type(unitData.trait_stats) ~= "table" then
+        return "N/A"
+    end
+
+    local traitService = GameModules.TraitServiceCore
+    local unitId = unitData.unit_id
+    local stats = unitData.trait_stats
+
+    local order = {
+        { key = "potency_stat", label = "ATK" },
+        { key = "speed_stat", label = "SPA" },
+        { key = "range_stat", label = "RNG" },
+    }
+
+    local parts = {}
+    for _, item in ipairs(order) do
+        local val = stats[item.key]
+        if type(val) == "number" and traitService then
+            local okRank, rank = pcall(traitService.calculate_stat_rank, unitId, stats, item.key, val)
+            local okPct, pctText = pcall(traitService.calculate_stat_text, unitData, item.key, val)
+            rank = (okRank and rank) or "?"
+            pctText = (okPct and pctText) or string.format("%+.1f%%", (val - 1) * 100)
+            table.insert(parts, string.format("%s: **%s** (%s)", item.label, tostring(rank), tostring(pctText)))
+        end
+    end
+
+    if #parts == 0 then
+        return "N/A"
+    end
+    return table.concat(parts, " | ")
+end
+
+function WebhookService:FormatUnitTraits(unitData)
+    if not unitData or type(unitData.traits) ~= "table" or #unitData.traits == 0 then
+        return "None"
+    end
+
+    local traitsData = GameModules.Traits
+    local traitService = GameModules.TraitServiceCore
+    local list = {}
+
+    for _, t in ipairs(unitData.traits) do
+        local tId = t.trait
+        local tTier = tostring(t.tier or "1")
+        local def = traitsData and traitsData[tId]
+        local name = (def and def.name) or tostring(tId)
+        if def and not def.singular and traitService then
+            local roman = traitService.convert_to_roman_numerals(tTier)
+            name = name .. " " .. tostring(roman)
+        end
+        table.insert(list, name)
+    end
+
+    return table.concat(list, ", ")
+end
+
+function WebhookService:BuildUnitEmbed(unitData, customTitle)
+    local unitId = unitData and unitData.unit_id or "unknown"
+    local unitDef = (GameModules.Units and GameModules.Units[unitId]) or {}
+    local unitName = unitDef.name or unitId
+    local rarity = unitDef.rarity or "Unknown"
+    local isShiny = unitData and unitData.shiny == true
+    local shinyTag = isShiny and "[SHINY] " or ""
+    local imageUrl = UnitImages:GetUrl(unitId)
+
+    local player = Players.LocalPlayer
+    local username = player and player.Name or "Unknown"
+    if Config.WebhookHideUsername and #username > 3 then
+        username = "||" .. username .. "||"
+    end
+
+    local level = GameModules:GetPlayerLevel()
+    local gems = GameModules:GetGemAmount()
+    local statsStr = self:FormatUnitStats(unitData)
+    local traitsStr = self:FormatUnitTraits(unitData)
+    local ownedCount = (GameModules.Session and GameModules.Session.collection and GameModules.Session.collection:size()) or 0
+
+    local embed = {
+        title = customTitle or string.format("%s%s (%s)", shinyTag, unitName, rarity),
+        color = self.RarityColors[rarity] or 0xFFFFFF,
+        fields = {
+            {
+                name = "Account",
+                value = string.format("%s (Lv. %d)", username, level),
+                inline = true,
+            },
+            {
+                name = "Unit",
+                value = string.format("**%s%s**\n`%s`", shinyTag, unitName, unitId),
+                inline = true,
+            },
+            {
+                name = "Rarity",
+                value = string.format("**%s**", rarity),
+                inline = true,
+            },
+            {
+                name = "Stats (ATK / SPA / RNG)",
+                value = statsStr,
+                inline = false,
+            },
+            {
+                name = "Traits",
+                value = traitsStr,
+                inline = true,
+            },
+            {
+                name = "Gems / Units",
+                value = string.format("Gems: **%d** | Units: **%d**", gems, ownedCount),
+                inline = true,
+            },
+        },
+        footer = {
+            text = "Anime Adventures Webhook | UUID: " .. tostring(unitData and unitData.uuid or "N/A"),
+        },
+        timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+    if Config.WebhookUseLargeImage then
+        embed.image = { url = imageUrl }
+    else
+        embed.thumbnail = { url = imageUrl }
+    end
+
+    return embed
+end
+
+function WebhookService:GetActiveWebhookUrls()
+    local urls = {}
+    local seen = {}
+
+    local function addUrl(u)
+        if type(u) == "string" then
+            local trimmed = string.match(u, "^%s*(.-)%s*$")
+            if trimmed and trimmed ~= "" and not seen[trimmed] then
+                seen[trimmed] = true
+                table.insert(urls, trimmed)
+            end
+        end
+    end
+
+    addUrl(Config.GlobalWebhookUrl)
+    addUrl(Config.WebhookUrl)
+    return urls
+end
+
+function WebhookService:SendPayload(payloadTable)
+    if not Config.WebhookEnabled then
+        return false, "Webhook disabled"
+    end
+
+    local urls = self:GetActiveWebhookUrls()
+    if #urls == 0 then
+        warn("[Main] Both GlobalWebhookUrl and WebhookUrl are empty in Config")
+        return false, "WebhookUrl is empty"
+    end
+
+    local reqFn = self:GetRequestFunction()
+    if not reqFn then
+        warn("[Main] Executor does not support HTTP request function")
+        return false, "No HTTP request function"
+    end
+
+    local bodyOk, bodyJson = pcall(function()
+        return HttpService:JSONEncode(payloadTable)
+    end)
+    if not bodyOk then
+        return false, "JSONEncode failed"
+    end
+
+    local anySuccess = false
+    local lastStatus = 0
+
+    for _, targetUrl in ipairs(urls) do
+        local sendOk, response = pcall(function()
+            return reqFn({
+                Url = targetUrl,
+                Method = "POST",
+                Headers = {
+                    ["Content-Type"] = "application/json",
+                },
+                Body = bodyJson,
+            })
+        end)
+
+        if sendOk then
+            anySuccess = true
+            lastStatus = type(response) == "table" and (response.StatusCode or response.Status) or 0
+            log("Webhook sent, status: " .. tostring(lastStatus))
+        else
+            warn("[Main] Webhook request error: " .. tostring(response))
+        end
+    end
+
+    return anySuccess, lastStatus
+end
+
+function WebhookService:SendUnitNotification(unitData, customTitle)
+    local embed = self:BuildUnitEmbed(unitData, customTitle)
+    local payload = {
+        username = "Anime Adventures Notifier",
+        embeds = { embed },
+    }
+    if type(Config.WebhookPingContent) == "string" and Config.WebhookPingContent ~= "" then
+        payload.content = Config.WebhookPingContent
+    end
+    return self:SendPayload(payload)
+end
+
+function WebhookService:ShouldNotifyUnit(unitData)
+    if not Config.WebhookEnabled or not unitData or not unitData.unit_id then
+        return false
+    end
+    local unitDef = GameModules.Units and GameModules.Units[unitData.unit_id]
+    if not unitDef or not unitDef.rarity then
+        return false
+    end
+    return Config.WebhookRarities[unitDef.rarity] == true
+end
+
+function WebhookService:OnUnitObtained(unitData)
+    if unitData and unitData.unit_id and GameModules.Units and GameModules.Units[unitData.unit_id] then
+        local rarity = GameModules.Units[unitData.unit_id].rarity
+        if rarity == "Mythic" then
+            self.ObtainedMythicInSession = true
+        elseif rarity == "Secret" then
+            self.ObtainedSecretInSession = true
+        end
+    end
+
+    if not self:ShouldNotifyUnit(unitData) then
+        return
+    end
+    local unitDef = GameModules.Units[unitData.unit_id]
+    log(string.format("Detected target unit obtained: %s (%s)", tostring(unitDef.name), tostring(unitDef.rarity)))
+    self:SendUnitNotification(unitData)
+end
+
+function WebhookService:HookUnitAdded()
+    if self.Hooked then
+        return
+    end
+
+    local collectionService = GameModules.UnitCollectionServiceClient
+    if not collectionService then
+        return
+    end
+
+    if not collectionService._orig_on_unit_added then
+        collectionService._orig_on_unit_added = collectionService.on_unit_added
+    end
+
+    collectionService.on_unit_added = function(unitData)
+        local res = collectionService._orig_on_unit_added(unitData)
+        task.spawn(function()
+            local ok, err = pcall(function()
+                self:OnUnitObtained(unitData)
+            end)
+            if not ok then
+                warn("[Main] Webhook OnUnitObtained error: " .. tostring(err))
+            end
+        end)
+        return res
+    end
+
+    self.Hooked = true
+    log("Hooked UnitCollectionServiceClient.on_unit_added for Webhook")
+end
+
+-- ============================================================================
+-- MODULE: JoinStart (First-Join Star Reveal, Starter Equip, UpdateUI Bypass)
+-- ============================================================================
+local JoinStart = {
+    Hooked = false,
+}
+
+function JoinStart:HookStarterAndSummonReveal()
+    if self.Hooked then
+        return
+    end
+
+    local summonService = GameModules.SummonServiceClient
+    if not summonService then
+        return
+    end
+
+    if not summonService._orig_show_unit_and_item_rewards then
+        summonService._orig_show_unit_and_item_rewards = summonService.show_unit_and_item_rewards
+    end
+
+    summonService.show_unit_and_item_rewards = function(items, units, isFirstUnits, a4, a5, a6)
+        if isFirstUnits and Config.SkipStarterAnimation then
+            log("Skipped starter unit star animation via hook")
+            return
+        end
+
+        if Config.SkipSummonAnimation and type(a6) == "table" and a6._hatched_through_banner then
+            log("Skipped banner summon star animation via hook")
+            if type(units) == "table" and #units > 0 and summonService.on_units_hatched_through_banner then
+                pcall(function()
+                    summonService.on_units_hatched_through_banner(units)
+                end)
+            end
+            return
+        end
+
+        return summonService._orig_show_unit_and_item_rewards(items, units, isFirstUnits, a4, a5, a6)
+    end
+
+    self.Hooked = true
+end
+
+function JoinStart:TriggerMouseClick()
+    local camera = workspace.CurrentCamera
+    local vp = camera and camera.ViewportSize or Vector2.new(800, 600)
+    local cx, cy = math.floor(vp.X * 0.5), math.floor(vp.Y * 0.5)
+
+    pcall(function()
+        VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, true, game, 1)
+        task.wait(0.05)
+        VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, false, game, 1)
+    end)
+
+    if type(getconnections) == "function" then
+        pcall(function()
+            local fakeInput = {
+                UserInputType = Enum.UserInputType.MouseButton1,
+                UserInputState = Enum.UserInputState.Begin,
+                KeyCode = Enum.KeyCode.Unknown,
+            }
+            for _, conn in ipairs(getconnections(UserInputService.InputBegan)) do
+                if conn.Function then
+                    task.spawn(conn.Function, fakeInput, false)
+                end
+            end
+        end)
+    end
+end
+
+function JoinStart:DismissActiveSummonReveal(timeout)
+    timeout = timeout or 15
+    local guiService = GameModules.GUIService
+    local summonUI = guiService and guiService.summon_ui
+    if not summonUI or not summonUI.hatching then
+        return
+    end
+
+    log("Starter star reveal is active, waiting for UnitInfoGUI to dismiss")
+    local startClock = os.clock()
+    while summonUI.hatching and (os.clock() - startClock < timeout) do
+        if summonUI.unitInfoGUI and summonUI.unitInfoGUI.Enabled then
+            self:TriggerMouseClick()
+            task.wait(0.25)
+        else
+            task.wait(0.1)
+        end
+    end
+
+    log("Starter star reveal dismissed")
+end
+
+function JoinStart:WaitForLoadingScreenFade(timeout)
+    timeout = timeout or 15
+    local localPlayer = Players.LocalPlayer
+    local playerGui = localPlayer and localPlayer:FindFirstChild("PlayerGui")
+    if not playerGui then
+        return
+    end
+
+    local startClock = os.clock()
+    while os.clock() - startClock < timeout do
+        local loadingGui = playerGui:FindFirstChild("Loading")
+        if not loadingGui or not loadingGui.Enabled then
+            break
+        end
+        local bg = loadingGui:FindFirstChild("bg")
+        if bg and bg.BackgroundTransparency >= 0.95 then
+            break
+        end
+        task.wait(0.1)
+    end
+end
+
+function JoinStart:DismissLobbyPopups(timeout)
+    timeout = timeout or 15
+    local guiService = GameModules.GUIService
+    local loginService = GameModules.LoginServiceClient
+    if not guiService or not loginService then
+        return
+    end
+
+    local startClock = os.clock()
+    while os.clock() - startClock < timeout do
+        if guiService.summon_ui and guiService.summon_ui.hatching then
+            self:DismissActiveSummonReveal(10)
+        end
+
+        if Config.AutoCloseUpdateUI and guiService.update_ui and guiService.update_ui.IsOpen then
+            log("Closing UpdateUI window")
+            pcall(function()
+                guiService.update_ui:toggle()
+            end)
+            task.wait(0.2)
+        end
+
+        if loginService._ready then
+            break
+        end
+
+        local isFirstLoad = loginService.session
+            and loginService.session.profile_data
+            and loginService.session.profile_data._FIRST_LOAD
+        local isFirstUpdate = loginService.session and loginService.session.first_join_on_update
+        if not isFirstLoad and not isFirstUpdate then
+            pcall(function()
+                loginService.on_ready()
+            end)
+            break
+        end
+
+        task.wait(0.15)
+    end
+
+    if not loginService._ready then
+        pcall(function()
+            loginService.on_ready()
+        end)
+    end
+
+    if Config.AutoCloseCalendarUI and guiService.christmas_calendar_ui and guiService.christmas_calendar_ui.IsOpen then
+        log("Closing HolidayRewards calendar window")
+        pcall(function()
+            guiService.christmas_calendar_ui:hide(true)
+        end)
+    end
+
+    pcall(function()
+        guiService.blur_off(true)
+        guiService.open_all_dockables()
+    end)
+end
+
+function JoinStart:GetStarterUnitUUID()
+    local loginService = GameModules.LoginServiceClient
+    local session = GameModules.Session
+    if not session then
+        return nil
+    end
+
+    if loginService and type(loginService.first_units) == "table" and loginService.first_units[1] then
+        return loginService.first_units[1]
+    end
+
+    local ownedUnits = session.profile_data
+        and session.profile_data.collection
+        and session.profile_data.collection.owned_units
+    if type(ownedUnits) == "table" then
+        local firstUuid = next(ownedUnits)
+        return firstUuid
+    end
+
+    return nil
+end
+
+function JoinStart:EnsureStarterUnitEquipped()
+    if not Config.AutoEquipStarterUnit then
+        return true
+    end
+
+    local session = GameModules.Session
+    if not session or not session.collection then
+        return false
+    end
+
+    if session.collection:get_used_equipped_slots() > 0 then
+        log("Equipped unit slot already populated")
+        return true
+    end
+
+    if session.profile_data and session.profile_data._FIRST_LOAD then
+        pcall(function()
+            GameModules:InvokeServer("equip_first_units")
+        end)
+        task.wait(0.25)
+    end
+
+    if session.collection:get_used_equipped_slots() > 0 then
+        log("Equipped starter unit via equip_first_units")
+        return true
+    end
+
+    local targetUuid = self:GetStarterUnitUUID()
+    if not targetUuid then
+        warn("[Main] No owned unit found to equip")
+        return false
+    end
+
+    log("Equipping unit UUID: " .. tostring(targetUuid))
+    pcall(function()
+        GameModules:InvokeServer("equip_unit", targetUuid)
+    end)
+
+    local startClock = os.clock()
+    while os.clock() - startClock < 3 do
+        if session.collection:get_used_equipped_slots() > 0 then
+            log("Unit equipped successfully")
+            return true
+        end
+        task.wait(0.1)
+    end
+
+    return session.collection:get_used_equipped_slots() > 0
+end
+
+function JoinStart:Run()
+    if not GameModules:Init(Config.JoinTimeout) then
+        return false
+    end
+
+    WebhookService:HookUnitAdded()
+    self:HookStarterAndSummonReveal()
+
+    if not GameModules.Loader.IsLobby then
+        log("Current place is not Lobby, skipping lobby JoinStart flow")
+        return true
+    end
+
+    log("Starting JoinStart handler")
+    self:WaitForLoadingScreenFade(15)
+    self:DismissActiveSummonReveal(15)
+    self:DismissLobbyPopups(15)
+    self:EnsureStarterUnitEquipped()
+    log("JoinStart complete, client ready")
+
+    return true
+end
+
+-- ============================================================================
+-- MODULE: CodeService (Auto Redeem Codes with minLevel & Redeemed Filter)
+-- ============================================================================
+local CodeService = {}
+
+function CodeService:NormalizeEntry(entry)
+    if type(entry) == "string" then
+        return entry, 1
+    elseif type(entry) == "table" and type(entry.code) == "string" then
+        return entry.code, tonumber(entry.minLevel) or 1
+    end
+    return nil, 1
+end
+
+function CodeService:IsCodeRedeemed(code)
+    local session = GameModules.Session
+    local redeemed = session and session.profile_data and session.profile_data.redeemed_codes
+    if type(redeemed) ~= "table" then
+        return false
+    end
+
+    local upper = string.upper(code)
+    local lower = string.lower(code)
+    if redeemed[code] or redeemed[upper] or redeemed[lower] then
+        return true
+    end
+
+    for _, val in pairs(redeemed) do
+        if type(val) == "string" and string.upper(val) == upper then
+            return true
+        end
+    end
+
+    return false
+end
+
+function CodeService:MarkCodeRedeemedLocal(code)
+    local session = GameModules.Session
+    if not session or not session.profile_data then
+        return
+    end
+    if type(session.profile_data.redeemed_codes) ~= "table" then
+        session.profile_data.redeemed_codes = {}
+    end
+    session.profile_data.redeemed_codes[code] = true
+end
+
+function CodeService:RedeemSingle(entry, playerLevel)
+    local code, minLevel = self:NormalizeEntry(entry)
+    if not code or code == "" then
+        return false, "invalid_entry"
+    end
+
+    playerLevel = playerLevel or GameModules:GetPlayerLevel()
+    if playerLevel < minLevel then
+        log(string.format("Skipped code %s (requires Lv. %d+, current Lv. %d)", code, minLevel, playerLevel))
+        return false, "skipped_level"
+    end
+
+    if self:IsCodeRedeemed(code) then
+        log(string.format("Skipped code %s (already redeemed)", code))
+        return false, "already_redeemed"
+    end
+
+    local guiService = GameModules.GUIService
+    local msgUI = guiService and guiService.message_ui
+    local lastServerMsg = nil
+    local lastServerColor = nil
+
+    if msgUI and not msgUI._orig_show_message then
+        msgUI._orig_show_message = msgUI.show_message
+    end
+    local origShow = msgUI and msgUI._orig_show_message
+
+    if msgUI and origShow then
+        msgUI.show_message = function(uiSelf, text, color, a3, a4, a5)
+            lastServerMsg = tostring(text or "")
+            lastServerColor = tostring(color or "")
+            return origShow(uiSelf, text, color, a3, a4, a5)
+        end
+    end
+
+    local ok, err = pcall(function()
+        GameModules:InvokeServer("redeem_code", code)
+    end)
+
+    if ok and msgUI and origShow then
+        local t0 = os.clock()
+        while not lastServerMsg and (os.clock() - t0 < 0.5) do
+            task.wait(0.05)
+        end
+    end
+
+    if msgUI and origShow then
+        msgUI.show_message = origShow
+    end
+
+    if not ok then
+        warn("[Main] Error redeeming code " .. code .. ": " .. tostring(err))
+        return false, "invoke_error"
+    end
+
+    local msgLower = string.lower(lastServerMsg or "")
+    if lastServerColor == "Success" or string.find(msgLower, "code redeemed") then
+        self:MarkCodeRedeemedLocal(code)
+        log(string.format("Code %s: Redeemed (%s)", code, lastServerMsg or "Success"))
+        return true, "redeemed"
+    elseif string.find(msgLower, "already redeemed") then
+        self:MarkCodeRedeemedLocal(code)
+        log(string.format("Code %s: Already redeemed", code))
+        return false, "already_redeemed"
+    elseif string.find(msgLower, "must be level") then
+        log(string.format("Code %s: %s", code, lastServerMsg))
+        return false, "skipped_level"
+    elseif lastServerColor == "Error" or string.find(msgLower, "unknown") or string.find(msgLower, "expired") or string.find(msgLower, "invalid") then
+        log(string.format("Code %s: %s", code, lastServerMsg or "Invalid/Expired"))
+        return false, "invalid_or_expired"
+    else
+        log(string.format("Code %s: Sent (%s)", code, lastServerMsg or "No message"))
+        return true, "redeemed"
+    end
+end
+
+function CodeService:RedeemAll()
+    if not Config.AutoRedeemCodes then
+        return
+    end
+
+    if not GameModules.Loader or not GameModules.Loader.IsLobby then
+        log("Current place is not Lobby, skipping CodeService")
+        return
+    end
+
+    local codes = Config.Codes
+    if type(codes) ~= "table" or #codes == 0 then
+        return
+    end
+
+    local playerLevel = GameModules:GetPlayerLevel()
+    log(string.format("Starting CodeService (Player Level: %d, Total Codes: %d)", playerLevel, #codes))
+
+    for _, entry in ipairs(codes) do
+        local redeemed, status = self:RedeemSingle(entry, playerLevel)
+        if status ~= "skipped_level" and status ~= "already_redeemed" and status ~= "invalid_entry" then
+            task.wait(Config.RedeemCodeDelay or 0.35)
+        end
+    end
+
+    log("CodeService finished")
+end
+
+-- ============================================================================
+-- MODULE: DailyService (Auto Claim Daily Login, Holiday Calendar, Milestones, Quests)
+-- ============================================================================
+local DailyService = {}
+
+function DailyService:ClaimDailyReward()
+    if not Config.AutoClaimDaily then
+        return false
+    end
+
+    local session = GameModules.Session
+    local gs = GameModules.GameplaySettings
+    local guiService = GameModules.GUIService
+    if not session or not session.profile_data then
+        return false
+    end
+
+    local lastClaimed = session.profile_data.last_daily_reward_claimed_time or 0
+    local waitTime = (gs and gs.DAILY_REWARD_WAIT) or 82800
+    local now = os.time()
+    local dailyUI = guiService and guiService.daily_rewards_ui
+    local canClaim = ((now - lastClaimed) >= waitTime) or (dailyUI and dailyUI.screenGUI and dailyUI.screenGUI.Enabled)
+
+    if not canClaim then
+        return false
+    end
+
+    log("Claiming Daily Login Reward")
+    pcall(function()
+        GameModules:InvokeServer("claim_daily_reward")
+    end)
+
+    if dailyUI and dailyUI.screenGUI then
+        pcall(function()
+            dailyUI.__clicked_once = true
+            dailyUI.screenGUI.Enabled = false
+        end)
+    end
+
+    return true
+end
+
+function DailyService:ClaimHolidayCalendar()
+    if not Config.AutoClaimHolidayCalendar then
+        return false
+    end
+
+    local session = GameModules.Session
+    local specialService = GameModules.SpecialEventServiceClient
+    local holidayRewards = GameModules.HolidayRewards
+    local guiService = GameModules.GUIService
+    if not session or not session.profile_data or not specialService or not holidayRewards then
+        return false
+    end
+
+    local availDay = specialService.christmas_calendar_available_day
+    if not availDay then
+        return false
+    end
+
+    local calId = holidayRewards._login_calendar_id
+    local calData = session.profile_data.login_calendar and session.profile_data.login_calendar[calId]
+    local alreadyClaimed = calData and calData.days_claimed and calData.days_claimed[tostring(availDay)]
+    if alreadyClaimed then
+        return false
+    end
+
+    log("Claiming Holiday Calendar Reward (Day " .. tostring(availDay) .. ")")
+    pcall(function()
+        GameModules:InvokeServer("claim_christmas_calendar_reward")
+    end)
+
+    if guiService and guiService.christmas_calendar_ui and guiService.christmas_calendar_ui.IsOpen then
+        pcall(function()
+            guiService.christmas_calendar_ui:hide(true)
+        end)
+    end
+
+    return true
+end
+
+function DailyService:ClaimLevelMilestones()
+    if not Config.AutoClaimLevelMilestones then
+        return 0
+    end
+
+    local session = GameModules.Session
+    local rewardsData = GameModules.PlayerLevelRewards
+    if not session or not session.profile_data or type(rewardsData) ~= "table" then
+        return 0
+    end
+
+    local claimedTable = session.profile_data.level_rewards_claimed or {}
+    local playerLevel = GameModules:GetPlayerLevel()
+    local claimedCount = 0
+
+    for _, entry in pairs(rewardsData) do
+        local reqLvl = tonumber(entry.level)
+        if reqLvl and playerLevel >= reqLvl and not claimedTable[entry.level] and not claimedTable[reqLvl] then
+            log("Claiming Player Level Milestone Reward: Lv. " .. tostring(entry.level))
+            pcall(function()
+                GameModules:InvokeServer("claim_player_level_rewards", entry.level)
+            end)
+            claimedCount = claimedCount + 1
+            task.wait(0.2)
+        end
+    end
+
+    return claimedCount
+end
+
+function DailyService:ClaimCompletedQuests()
+    if not Config.AutoClaimQuests then
+        return 0
+    end
+
+    local session = GameModules.Session
+    local quests = session
+        and session.quest_handler
+        and session.quest_handler.quest_profile_data
+        and session.quest_handler.quest_profile_data.quests
+    if type(quests) ~= "table" then
+        return 0
+    end
+
+    local claimedCount = 0
+    for uuid, q in pairs(quests) do
+        local isCompleted = false
+        pcall(function()
+            if type(q.is_completed) == "function" then
+                isCompleted = q:is_completed()
+            elseif q.quest_progress and q.quest_info and q.quest_info.quest_class then
+                local goal = q.quest_info.quest_class.amount or q.quest_info.quest_class.goal
+                local prog = q.quest_progress.amount or q.quest_progress.progress
+                if type(goal) == "number" and type(prog) == "number" and prog >= goal then
+                    isCompleted = true
+                end
+            end
+        end)
+
+        if isCompleted then
+            log("Claiming completed quest UUID: " .. tostring(uuid))
+            pcall(function()
+                GameModules:InvokeServer("redeem_quest", uuid)
+            end)
+            claimedCount = claimedCount + 1
+            task.wait(0.2)
+        end
+    end
+
+    return claimedCount
+end
+
+function DailyService:ClaimAll()
+    if not GameModules.Loader or not GameModules.Loader.IsLobby then
+        return
+    end
+
+    log("Running DailyService checks")
+    self:ClaimDailyReward()
+    self:ClaimHolidayCalendar()
+    self:ClaimLevelMilestones()
+    self:ClaimCompletedQuests()
+end
+
+-- ============================================================================
+-- MODULE: SummonService (Auto Summon Banner with Tickets & Gems)
+-- ============================================================================
+local SummonService = {
+    Running = false,
+}
+
+function SummonService:GetSummonTicketCount()
+    local session = GameModules.Session
+    if not session or not session.inventory then
+        return 0
+    end
+    local ok, count = pcall(function()
+        return session.inventory:get_number_of_owned_item("summon_ticket")
+    end)
+    return (ok and tonumber(count)) or 0
+end
+
+function SummonService:GetGemCosts(bannerName)
+    local banners = GameModules.Banners
+    local bannerDef = banners and banners[bannerName]
+    local baseGemCost = (bannerDef and bannerDef.gem_cost) or 50
+    local summonCore = GameModules.SummonServiceCore
+    local session = GameModules.Session
+
+    local singleCost = baseGemCost
+    if summonCore and session then
+        local ok, calc = pcall(function()
+            return summonCore.calculate_hatch_price(session, baseGemCost, "gems")
+        end)
+        if ok and type(calc) == "number" and calc > 0 then
+            singleCost = calc
+        end
+    end
+
+    return singleCost, singleCost * 10
+end
+
+function SummonService:WaitUntilHatchComplete(timeout)
+    timeout = timeout or 12
+    local guiService = GameModules.GUIService
+    local summonUI = guiService and guiService.summon_ui
+    if not summonUI then
+        return
+    end
+
+    local t0 = os.clock()
+    while summonUI.hatching and (os.clock() - t0 < timeout) do
+        if summonUI.unitInfoGUI and summonUI.unitInfoGUI.Enabled then
+            JoinStart:TriggerMouseClick()
+            task.wait(0.2)
+        else
+            task.wait(0.1)
+        end
+    end
+end
+
+function SummonService:ShouldStopByTargetRarity()
+    if Config.StopSummonOnSecret and WebhookService.ObtainedSecretInSession then
+        log("Stopping AutoSummon: Obtained Secret unit in session")
+        return true
+    end
+    if Config.StopSummonOnMythic and WebhookService.ObtainedMythicInSession then
+        log("Stopping AutoSummon: Obtained Mythic unit in session")
+        return true
+    end
+    return false
+end
+
+function SummonService:Run()
+    if not Config.AutoSummonEnabled or self.Running then
+        return
+    end
+
+    if not GameModules.Loader or not GameModules.Loader.IsLobby then
+        return
+    end
+
+    local playerLevel = GameModules:GetPlayerLevel()
+    if Config.AutoFarmEnabled and playerLevel < (Config.TargetFarmLevel or 1) then
+        log(string.format("Skipping SummonService: Player Level (%d) < TargetFarmLevel (%d)", playerLevel, Config.TargetFarmLevel))
+        return
+    end
+
+    local bannerName = Config.SummonBanner or "EventClover"
+    local banners = GameModules.Banners
+    local bannerDef = banners and banners[bannerName]
+    if not bannerDef then
+        warn("[Main] Invalid SummonBanner in Config: " .. tostring(bannerName))
+        return
+    end
+
+    self.Running = true
+    local singleCost, tenCost = self:GetGemCosts(bannerName)
+    local keepGems = Config.KeepGemAmount or 0
+    log(string.format("Starting SummonService on banner '%s' (1x=%d Gems, 10x=%d Gems, Keep=%d)", bannerName, singleCost, tenCost, keepGems))
+
+    -- 1. Use Summon Tickets first if enabled and allowed on banner
+    if Config.UseSummonTickets and not bannerDef._no_summon_ticket then
+        while self.Running and not self:ShouldStopByTargetRarity() do
+            local tickets = self:GetSummonTicketCount()
+            if tickets <= 0 then
+                break
+            end
+
+            log(string.format("Summoning 1x with Summon Ticket on %s (Tickets left: %d)", bannerName, tickets))
+            pcall(function()
+                GameModules:InvokeServer("buy_from_banner", bannerName, "ticket")
+            end)
+            task.wait(Config.SummonDelay or 0.4)
+            self:WaitUntilHatchComplete(10)
+        end
+    end
+
+    -- 2. Use Gems (gems10 then gems)
+    while self.Running and not self:ShouldStopByTargetRarity() do
+        local currentGems = GameModules:GetGemAmount()
+        local spendableGems = currentGems - keepGems
+
+        if Config.PreferTenPull and spendableGems >= tenCost then
+            log(string.format("Summoning 10x on %s (Gems: %d)", bannerName, currentGems))
+            pcall(function()
+                GameModules:InvokeServer("buy_from_banner", bannerName, "gems10")
+            end)
+            task.wait(Config.SummonDelay or 0.4)
+            self:WaitUntilHatchComplete(12)
+        elseif Config.AllowSinglePull and spendableGems >= singleCost then
+            log(string.format("Summoning 1x on %s (Gems: %d)", bannerName, currentGems))
+            pcall(function()
+                GameModules:InvokeServer("buy_from_banner", bannerName, "gems")
+            end)
+            task.wait(Config.SummonDelay or 0.4)
+            self:WaitUntilHatchComplete(10)
+        else
+            break
+        end
+    end
+
+    self.Running = false
+    log(string.format("SummonService finished (Remaining Gems: %d)", GameModules:GetGemAmount()))
+end
+
+-- ============================================================================
+-- MODULE: FarmService (Planet Greenie World Skip + AFK Loss + Replay Loop)
+-- ============================================================================
+local FarmService = {
+    Running = false,
+    VoteSkipHooked = false,
+    VoteStartHooked = false,
+    TeleportQueued = false,
+}
+
+function FarmService:SetupTeleportAutoReload()
+    if not Config.AutoReloadOnTeleport or self.TeleportQueued then
+        return
+    end
+
+    local qot = (type(queue_on_teleport) == "function" and queue_on_teleport)
+        or (type(syn) == "table" and type(syn.queue_on_teleport) == "function" and syn.queue_on_teleport)
+        or (type(fluxus) == "table" and type(fluxus.queue_on_teleport) == "function" and fluxus.queue_on_teleport)
+
+    if not qot then
+        return
+    end
+
+    local ok = pcall(function()
+        qot([[
+            task.spawn(function()
+                if not game:IsLoaded() then
+                    game.Loaded:Wait()
+                end
+                if type(isfile) == "function" and type(readfile) == "function" and isfile("aa_main_autoload.lua") then
+                    local fn = loadstring(readfile("aa_main_autoload.lua"))
+                    if fn then
+                        fn()
+                    end
+                end
+            end)
+        ]])
+    end)
+
+    if ok then
+        self.TeleportQueued = true
+        log("Registered queue_on_teleport for aa_main_autoload.lua")
+    end
+end
+
+function FarmService:TriggerVoteStart()
+    if not Config.AutoVoteStart then
+        return false
+    end
+
+    local guiService = GameModules.GUIService
+    local dataFolder = workspace:FindFirstChild("_DATA")
+    local gameStarted = dataFolder and dataFolder:FindFirstChild("GameStarted") and dataFolder.GameStarted.Value
+    local voteStartFolder = dataFolder and dataFolder:FindFirstChild("VoteStart")
+    local votingFinished = voteStartFolder and voteStartFolder:FindFirstChild("VotingFinished") and voteStartFolder.VotingFinished.Value
+
+    -- Skip NewArea intro banner so VoteStart is not delayed by 3.5s
+    local newAreaGui = guiService and guiService.new_area_gui
+    if newAreaGui and (not newAreaGui.shown_once or (newAreaGui.screenGUI and newAreaGui.screenGUI.Enabled)) then
+        pcall(function()
+            newAreaGui:stop_tweens()
+            newAreaGui.shown_once = true
+            newAreaGui:hide()
+        end)
+    end
+
+    local startVoteUI = guiService and guiService.start_vote_ui
+    if gameStarted or votingFinished then
+        if startVoteUI and startVoteUI.screenGUI and startVoteUI.screenGUI.Enabled then
+            pcall(function()
+                startVoteUI.screenGUI.Enabled = false
+            end)
+        end
+        return false
+    end
+
+    if startVoteUI then
+        pcall(function()
+            if not startVoteUI.voted and voteStartFolder and voteStartFolder:FindFirstChild("Votes") then
+                voteStartFolder.Votes.Value = voteStartFolder.Votes.Value + 1
+                startVoteUI.voted = true
+                startVoteUI:update_vote_count(voteStartFolder.Votes.Value)
+            end
+        end)
+    end
+
+    pcall(function()
+        GameModules:InvokeServer("vote_start")
+    end)
+
+    if startVoteUI and startVoteUI.screenGUI then
+        pcall(function()
+            startVoteUI.screenGUI.Enabled = false
+        end)
+    end
+
+    return true
+end
+
+function FarmService:HookVoteStartUI()
+    if self.VoteStartHooked then
+        return
+    end
+
+    local guiService = GameModules.GUIService
+    local startVoteUI = guiService and guiService.start_vote_ui
+    if not startVoteUI then
+        return
+    end
+
+    if not startVoteUI._orig_update_visibility then
+        startVoteUI._orig_update_visibility = startVoteUI.update_visibility
+    end
+
+    startVoteUI.update_visibility = function(uiSelf, ...)
+        local res = startVoteUI._orig_update_visibility(uiSelf, ...)
+        if Config.AutoVoteStart then
+            task.spawn(function()
+                self:TriggerVoteStart()
+            end)
+        end
+        return res
+    end
+
+    self.VoteStartHooked = true
+    log("Hooked StartVoteUI.update_visibility for instant Vote Start")
+end
+
+function FarmService:ShouldFarm()
+    if not Config.AutoFarmEnabled then
+        return false
+    end
+    local playerLevel = GameModules:GetPlayerLevel()
+    local targetLevel = tonumber(Config.TargetFarmLevel) or 20
+    return playerLevel < targetLevel
+end
+
+function FarmService:FindEmptyStoryLobby()
+    local lobbiesRoot = workspace:FindFirstChild("_LOBBIES")
+    local storyFolder = lobbiesRoot and lobbiesRoot:FindFirstChild("Story")
+    if not storyFolder then
+        return nil
+    end
+
+    for _, model in ipairs(storyFolder:GetChildren()) do
+        local owner = model:FindFirstChild("Owner") and model.Owner.Value
+        local active = model:FindFirstChild("Active") and model.Active.Value
+        if not owner and not active then
+            return model
+        end
+    end
+
+    return nil
+end
+
+function FarmService:EnterStoryMatch()
+    if not GameModules.Loader or not GameModules.Loader.IsLobby then
+        return false
+    end
+
+    local playerLevel = GameModules:GetPlayerLevel()
+    local targetLevel = tonumber(Config.TargetFarmLevel) or 20
+    log(string.format("Player Level (%d) < TargetFarmLevel (%d), entering Story match", playerLevel, targetLevel))
+
+    local targetWorld = Config.FarmWorld or "namek"
+    local targetStage = Config.FarmLevel or "namek_level_6"
+    local difficulty = Config.FarmDifficulty or "Normal"
+
+    for attempt = 1, 10 do
+        local lobbyModel = self:FindEmptyStoryLobby()
+        if lobbyModel then
+            log(string.format("Joining Story lobby: %s (Attempt %d)", lobbyModel.Name, attempt))
+            local joined = false
+            pcall(function()
+                joined = GameModules:InvokeServer("request_join_lobby", lobbyModel.Name) == true
+            end)
+
+            if joined then
+                task.wait(0.2)
+
+                -- Close any World Skip UI popup if open
+                local guiService = GameModules.GUIService
+                if guiService and guiService.notification_windows_ui then
+                    pcall(function()
+                        guiService.notification_windows_ui:hide()
+                    end)
+                end
+
+                -- Method 1: Use World Skip (lobby_world_skip) for instant teleport into Act 6
+                if Config.UseWorldSkip then
+                    log(string.format("Invoking lobby_world_skip('%s') for instant match start", targetWorld))
+                    pcall(function()
+                        GameModules:InvokeServer("lobby_world_skip", targetWorld)
+                    end)
+                    task.wait(1.5)
+                end
+
+                -- Method 2: Standard lock level + start game (if World Skip already completed or disabled)
+                local locked = false
+                pcall(function()
+                    locked = GameModules:InvokeServer("request_lock_level", lobbyModel.Name, targetStage, true, difficulty) == true
+                end)
+
+                if not locked and targetStage ~= "namek_level_1" then
+                    pcall(function()
+                        locked = GameModules:InvokeServer("request_lock_level", lobbyModel.Name, "namek_level_1", true, difficulty) == true
+                    end)
+                end
+
+                if locked then
+                    task.wait(0.2)
+                    log("Starting Story match via request_start_game")
+                    pcall(function()
+                        GameModules:InvokeServer("request_start_game", lobbyModel.Name)
+                    end)
+                end
+
+                return true
+            end
+        end
+        task.wait(1)
+    end
+
+    warn("[Main] Failed to find or join an empty Story lobby")
+    return false
+end
+
+function FarmService:EnableAutoSkipSetting()
+    if not Config.AutoSkipWaves then
+        return
+    end
+
+    local player = Players.LocalPlayer
+    local settingsFolder = player and player:FindFirstChild("_settings")
+    local autoSkipVal = settingsFolder and settingsFolder:FindFirstChild("autoskip_waves")
+    if autoSkipVal and not autoSkipVal.Value then
+        pcall(function()
+            autoSkipVal.Value = true
+            GameModules:InvokeServer("toggle_setting", "autoskip_waves", true)
+        end)
+        log("Enabled autoskip_waves setting")
+    end
+
+    local guiService = GameModules.GUIService
+    local voteWaveUI = guiService and guiService.vote_wave_ui
+    if voteWaveUI and not self.VoteSkipHooked then
+        if not voteWaveUI._orig_on_start_vote_wave_skip then
+            voteWaveUI._orig_on_start_vote_wave_skip = voteWaveUI.on_start_vote_wave_skip
+        end
+        voteWaveUI.on_start_vote_wave_skip = function(uiSelf, ...)
+            if Config.AutoSkipWaves then
+                task.spawn(function()
+                    pcall(function()
+                        GameModules:InvokeServer("vote_wave_skip")
+                    end)
+                end)
+            end
+            return voteWaveUI._orig_on_start_vote_wave_skip(uiSelf, ...)
+        end
+        self.VoteSkipHooked = true
+    end
+end
+
+function FarmService:RunInGame()
+    if GameModules.Loader and GameModules.Loader.IsLobby then
+        return
+    end
+    if self.Running then
+        return
+    end
+
+    self.Running = true
+    log("Starting In-Game AFK Loss & Replay loop")
+    self:EnableAutoSkipSetting()
+    self:HookVoteStartUI()
+    self:TriggerVoteStart()
+
+    task.spawn(function()
+        local lastVoteStart = 0
+        local lastVoteSkip = 0
+        local handledResultsForMatch = false
+
+        while self.Running do
+            local guiService = GameModules.GUIService
+            local dataFolder = workspace:FindFirstChild("_DATA")
+            local gameStarted = dataFolder and dataFolder:FindFirstChild("GameStarted") and dataFolder.GameStarted.Value
+            local voteStartFolder = dataFolder and dataFolder:FindFirstChild("VoteStart")
+            local votingFinished = voteStartFolder and voteStartFolder:FindFirstChild("VotingFinished") and voteStartFolder.VotingFinished.Value
+
+            -- 1. Vote Start before match begins (and dismiss VoteStart UI if shown)
+            if Config.AutoVoteStart then
+                local startVoteUI = guiService and guiService.start_vote_ui
+                local uiShown = startVoteUI and startVoteUI.screenGUI and startVoteUI.screenGUI.Enabled
+                if (not gameStarted and not votingFinished) or uiShown then
+                    if os.clock() - lastVoteStart >= 0.5 then
+                        lastVoteStart = os.clock()
+                        self:TriggerVoteStart()
+                    end
+                end
+            end
+
+            -- 2. Vote Wave Skip during match so mobs destroy base faster
+            if Config.AutoSkipWaves and gameStarted then
+                local voteWaveUI = guiService and guiService.vote_wave_ui
+                if voteWaveUI and voteWaveUI.screenGUI and voteWaveUI.screenGUI.Enabled then
+                    if os.clock() - lastVoteSkip >= 0.5 then
+                        lastVoteSkip = os.clock()
+                        pcall(function()
+                            if GameModules:InvokeServer("vote_wave_skip") then
+                                voteWaveUI.screenGUI.Enabled = false
+                            end
+                        end)
+                    end
+                end
+            end
+
+            -- 3. Handle ResultsUI on match finish (Defeat / Victory)
+            local resultsUI = guiService and guiService.results_ui
+            if resultsUI and resultsUI.screenGUI and resultsUI.screenGUI.Enabled then
+                if not handledResultsForMatch then
+                    handledResultsForMatch = true
+                    task.wait(0.5)
+
+                    pcall(function()
+                        resultsUI.Holder.Visible = false
+                        resultsUI.BG.Visible = false
+                        resultsUI:show_unit_and_item_rewards()
+                    end)
+
+                    task.wait(0.3)
+                    local currentLevel = GameModules:GetPlayerLevel()
+                    local targetLevel = tonumber(Config.TargetFarmLevel) or 20
+
+                    if Config.AutoFarmEnabled and currentLevel < targetLevel then
+                        log(string.format("Match ended (Player Level: %d / %d) -> Voting Replay", currentLevel, targetLevel))
+                        pcall(function()
+                            GameModules:InvokeServer("set_game_finished_vote", "replay")
+                        end)
+                    else
+                        log(string.format("Target Level reached (%d >= %d) -> Returning to Lobby", currentLevel, targetLevel))
+                        pcall(function()
+                            GameModules:InvokeServer("teleport_back_to_lobby")
+                        end)
+                    end
+                else
+                    -- Retry vote every 2s until server teleports
+                    local currentLevel = GameModules:GetPlayerLevel()
+                    local targetLevel = tonumber(Config.TargetFarmLevel) or 20
+                    pcall(function()
+                        if Config.AutoFarmEnabled and currentLevel < targetLevel then
+                            GameModules:InvokeServer("set_game_finished_vote", "replay")
+                        else
+                            GameModules:InvokeServer("teleport_back_to_lobby")
+                        end
+                    end)
+                    task.wait(1.5)
+                end
+            else
+                handledResultsForMatch = false
+            end
+
+            task.wait(0.3)
+        end
+    end)
+end
+
+-- ============================================================================
+-- MODULE: AntiAfkService (Disable Roblox 20m Idle Kick + VirtualUser Fallback)
+-- ============================================================================
+local AntiAfkService = {
+    Started = false,
+    IdledConnection = nil,
+}
+
+function AntiAfkService:Start()
+    if not Config.AntiAfkEnabled or self.Started then
+        return false
+    end
+
+    local player = Players.LocalPlayer
+    if not player then
+        return false
+    end
+
+    local disabledCount = 0
+    if type(getconnections) == "function" then
+        pcall(function()
+            for _, conn in ipairs(getconnections(player.Idled)) do
+                if type(conn.Disable) == "function" then
+                    conn:Disable()
+                    disabledCount = disabledCount + 1
+                elseif type(conn.Disconnect) == "function" then
+                    conn:Disconnect()
+                    disabledCount = disabledCount + 1
+                end
+            end
+        end)
+    end
+
+    local VirtualUser = nil
+    pcall(function()
+        VirtualUser = game:GetService("VirtualUser")
+    end)
+
+    self.IdledConnection = player.Idled:Connect(function()
+        if not Config.AntiAfkEnabled then
+            return
+        end
+        pcall(function()
+            if VirtualUser then
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.new(0, 0))
+            elseif VirtualInputManager then
+                VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.RightControl, false, game)
+                task.wait(0.05)
+                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.RightControl, false, game)
+            end
+        end)
+    end)
+
+    self.Started = true
+    log(string.format("AntiAfkService enabled (Disabled %d Idled connections + VirtualUser fallback)", disabledCount))
+    return true
+end
+
+-- ============================================================================
+-- MODULE: PerformanceService (Anti-Lag, Map Stripper, VFX/Unit Cleaner)
+-- ============================================================================
+local PerformanceService = {
+    Started = false,
+    Connections = {},
+}
+
+function PerformanceService:ApplyEngineAndLightingSettings()
+    local Lighting = game:GetService("Lighting")
+    pcall(function()
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 9e9
+        Lighting.Brightness = 1
+        Lighting.EnvironmentDiffuseScale = 0
+        Lighting.EnvironmentSpecularScale = 0
+    end)
+
+    for _, inst in ipairs(Lighting:GetDescendants()) do
+        if inst:IsA("PostEffect") or inst:IsA("Atmosphere") or inst:IsA("Sky") or inst:IsA("Clouds") then
+            pcall(function()
+                if inst:IsA("PostEffect") then
+                    inst.Enabled = false
+                end
+                inst:Destroy()
+            end)
+        end
+    end
+
+    pcall(function()
+        settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+    end)
+
+    pcall(function()
+        local terrain = workspace:FindFirstChildOfClass("Terrain")
+        if terrain then
+            terrain.WaterWaveSize = 0
+            terrain.WaterWaveSpeed = 0
+            terrain.WaterReflectance = 0
+            terrain.WaterTransparency = 0
+            terrain.Decoration = false
+        end
+    end)
+
+    if type(Config.FpsCap) == "number" and Config.FpsCap > 0 and type(setfpscap) == "function" then
+        pcall(function()
+            setfpscap(Config.FpsCap)
+        end)
+    end
+
+    if Config.Disable3DRenderingInMatch and GameModules.Loader and not GameModules.Loader.IsLobby then
+        pcall(function()
+            game:GetService("RunService"):Set3dRenderingEnabled(false)
+        end)
+    end
+end
+
+function PerformanceService:ApplyGameLowQualitySettings()
+    if not Config.ApplyLowQualityGameSettings then
+        return
+    end
+
+    local player = Players.LocalPlayer
+    local settingsFolder = player and player:FindFirstChild("_settings")
+    if not settingsFolder then
+        return
+    end
+
+    local desiredBoolSettings = {
+        low_quality = true,
+        low_quality_shadows = true,
+        low_quality_textures = true,
+        disable_effects = true,
+        disable_kill_fx = true,
+        disable_other_fx = true,
+        hide_other_pets = true,
+        hide_damage_modifiers = true,
+        dynamic_depth_of_field = false,
+        show_damage_text = false,
+        show_all_unit_health = false,
+        show_overheads = false,
+        show_other_overheads = false,
+    }
+
+    for settingName, targetVal in pairs(desiredBoolSettings) do
+        local valObj = settingsFolder:FindFirstChild(settingName)
+        if valObj and valObj.Value ~= targetVal then
+            pcall(function()
+                valObj.Value = targetVal
+            end)
+        end
+    end
+
+    local sliderZeros = { "game_volume", "music_volume", "lobby_music_volume" }
+    for _, sliderName in ipairs(sliderZeros) do
+        local valObj = settingsFolder:FindFirstChild(sliderName)
+        if valObj and valObj.Value ~= 0 then
+            pcall(function()
+                valObj.Value = 0
+            end)
+        end
+    end
+end
+
+function PerformanceService:HookFXServices()
+    pcall(function()
+        local fxService = GameModules.Loader and GameModules.Loader.load_client_service(script, "FXServiceClient")
+        if fxService and not fxService._perf_hooked then
+            fxService._perf_hooked = true
+            fxService._start_fx = function()
+                return nil
+            end
+            fxService.start_fx_server = function()
+                return nil
+            end
+            fxService.start_fx_client = function()
+                return nil
+            end
+        end
+    end)
+
+    pcall(function()
+        local lightingService = GameModules.Loader and GameModules.Loader.load_client_service(script, "LightingServiceClient")
+        if lightingService and not lightingService._perf_hooked then
+            lightingService._perf_hooked = true
+            lightingService.change_lighting = function() end
+            lightingService.refresh_ = function() end
+        end
+    end)
+end
+
+function PerformanceService:StripInstanceVisuals(inst)
+    if inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam") or inst:IsA("Fire") or inst:IsA("Smoke") or inst:IsA("Sparkles") or inst:IsA("Highlight") or inst:IsA("PointLight") or inst:IsA("SpotLight") or inst:IsA("SurfaceLight") then
+        pcall(function()
+            inst.Enabled = false
+            inst:Destroy()
+        end)
+    elseif inst:IsA("Decal") or inst:IsA("Texture") or inst:IsA("SurfaceAppearance") then
+        pcall(function()
+            inst:Destroy()
+        end)
+    elseif inst:IsA("MeshPart") then
+        pcall(function()
+            inst.TextureID = ""
+            inst.Material = Enum.Material.SmoothPlastic
+            inst.CastShadow = false
+        end)
+    elseif inst:IsA("BasePart") then
+        pcall(function()
+            inst.Material = Enum.Material.SmoothPlastic
+            inst.CastShadow = false
+        end)
+    elseif inst:IsA("SpecialMesh") then
+        pcall(function()
+            inst.TextureId = ""
+        end)
+    end
+end
+
+function PerformanceService:CleanMapAndTerrain()
+    if not Config.RemoveMapDecorations then
+        return
+    end
+
+    local isLobby = GameModules.Loader and GameModules.Loader.IsLobby
+    if isLobby then
+        for _, inst in ipairs(workspace:GetDescendants()) do
+            self:StripInstanceVisuals(inst)
+        end
+        return
+    end
+
+    -- Wait until Setup.lua finishes reading _MAP_CONFIG.MapLoaded & LevelData
+    local mapConfig = workspace:FindFirstChild("_MAP_CONFIG")
+    local mapLoaded = mapConfig and mapConfig:FindFirstChild("MapLoaded")
+    if mapLoaded and not mapLoaded.Value then
+        local t0 = os.clock()
+        while not mapLoaded.Value and (os.clock() - t0 < 10) do
+            task.wait(0.2)
+        end
+    end
+
+    local removedCount = 0
+
+    -- 1. Clear workspace._map children (trees, grass, mushrooms, bridges, props)
+    local mapFolder = workspace:FindFirstChild("_map")
+    if mapFolder then
+        for _, child in ipairs(mapFolder:GetChildren()) do
+            pcall(function()
+                child:Destroy()
+                removedCount = removedCount + 1
+            end)
+        end
+        table.insert(self.Connections, mapFolder.ChildAdded:Connect(function(child)
+            task.defer(function()
+                pcall(function()
+                    child:Destroy()
+                end)
+            end)
+        end))
+    end
+
+    -- 2. Clear decorative folders in workspace._terrain while keeping "ground" for raycasts
+    local terrainFolder = workspace:FindFirstChild("_terrain")
+    if terrainFolder then
+        for _, child in ipairs(terrainFolder:GetChildren()) do
+            if child.Name ~= "ground" then
+                pcall(function()
+                    child:Destroy()
+                    removedCount = removedCount + 1
+                end)
+            else
+                for _, desc in ipairs(child:GetDescendants()) do
+                    self:StripInstanceVisuals(desc)
+                    if desc:IsA("BasePart") then
+                        desc.Transparency = 1
+                    end
+                end
+            end
+        end
+    end
+
+    -- 3. Hide _road and _water_blocks visuals while keeping instances alive
+    for _, folderName in ipairs({ "_road", "_water_blocks", "_BASES" }) do
+        local f = workspace:FindFirstChild(folderName)
+        if f then
+            for _, desc in ipairs(f:GetDescendants()) do
+                self:StripInstanceVisuals(desc)
+            end
+        end
+    end
+
+    log(string.format("PerformanceService cleaned Map & Terrain (%d top-level groups removed)", removedCount))
+end
+
+function PerformanceService:StripUnitModel(unitModel)
+    if not Config.StripUnitVisuals or not unitModel then
+        return
+    end
+
+    task.defer(function()
+        local stripChildNames = {
+            ["_cell_shading"] = true,
+            ["_shadow"] = true,
+            ["Shirt"] = true,
+            ["Pants"] = true,
+            ["ShirtGraphic"] = true,
+            ["BodyColors"] = true,
+        }
+
+        for _, desc in ipairs(unitModel:GetDescendants()) do
+            if stripChildNames[desc.Name] or desc:IsA("Accessory") or desc:IsA("Clothing") or desc:IsA("CharacterMesh") or desc:IsA("SpecialMesh") or desc:IsA("ParticleEmitter") or desc:IsA("Trail") or desc:IsA("Beam") or desc:IsA("Decal") or desc:IsA("Texture") or desc:IsA("Highlight") then
+                pcall(function()
+                    desc:Destroy()
+                end)
+            elseif desc:IsA("BasePart") then
+                pcall(function()
+                    desc.Material = Enum.Material.SmoothPlastic
+                    desc.CastShadow = false
+                    if desc.Name ~= "HumanoidRootPart" then
+                        desc.Transparency = 1
+                    end
+                end)
+            elseif desc:IsA("BillboardGui") and desc.Name == "_overhead" then
+                pcall(function()
+                    desc.Enabled = false
+                end)
+            end
+        end
+    end)
+end
+
+function PerformanceService:SetupUnitAndVFXCleaners()
+    if GameModules.Loader and GameModules.Loader.IsLobby then
+        return
+    end
+
+    -- 1. Strip spawned units in workspace._UNITS
+    if Config.StripUnitVisuals then
+        local unitsFolder = workspace:FindFirstChild("_UNITS")
+        if unitsFolder then
+            for _, unitModel in ipairs(unitsFolder:GetChildren()) do
+                self:StripUnitModel(unitModel)
+            end
+            table.insert(self.Connections, unitsFolder.ChildAdded:Connect(function(unitModel)
+                self:StripUnitModel(unitModel)
+            end))
+        end
+    end
+
+    -- 2. Clear BoltPart & VFX parts in CurrentCamera and workspace.ignore
+    if Config.ClearCameraVFX then
+        local cam = workspace.CurrentCamera
+        if cam then
+            for _, child in ipairs(cam:GetChildren()) do
+                if child:IsA("BasePart") or child:IsA("Model") or child:IsA("Folder") then
+                    pcall(function()
+                        child:Destroy()
+                    end)
+                end
+            end
+            table.insert(self.Connections, cam.ChildAdded:Connect(function(child)
+                if child:IsA("BasePart") or child:IsA("Model") or child:IsA("Folder") then
+                    task.defer(function()
+                        pcall(function()
+                            child:Destroy()
+                        end)
+                    end)
+                end
+            end))
+        end
+
+        local ignoreFolder = workspace:FindFirstChild("ignore")
+        if ignoreFolder then
+            for _, child in ipairs(ignoreFolder:GetChildren()) do
+                pcall(function()
+                    child:Destroy()
+                end)
+            end
+            table.insert(self.Connections, ignoreFolder.ChildAdded:Connect(function(child)
+                task.defer(function()
+                    pcall(function()
+                        child:Destroy()
+                    end)
+                end)
+            end))
+        end
+    end
+end
+
+function PerformanceService:Start()
+    if not Config.OptimizePerformance or self.Started then
+        return false
+    end
+
+    self.Started = true
+    self:ApplyEngineAndLightingSettings()
+    self:ApplyGameLowQualitySettings()
+    self:HookFXServices()
+    self:CleanMapAndTerrain()
+    self:SetupUnitAndVFXCleaners()
+
+    log("PerformanceService optimization complete")
+    return true
+end
+
+-- ============================================================================
+-- MODULE: KaitunUIService (Full-Screen Kaitun Dashboard Overlay based on ui.lua)
+-- ============================================================================
+local KaitunUIService = {
+    ScreenGui = nil,
+    IsHidden = false,
+}
+
+function KaitunUIService:FormatTime(seconds)
+    seconds = math.max(0, tonumber(seconds) or 0)
+    local hrs = math.floor(seconds / 3600)
+    local mins = math.floor((seconds % 3600) / 60)
+    local secs = math.floor(seconds % 60)
+    return string.format("%02d:%02d:%02d", hrs, mins, secs)
+end
+
+function KaitunUIService:FormatCompactNumber(n)
+    n = tonumber(n) or 0
+    if n >= 1e15 then
+        return string.format("%.2fQ", n / 1e15)
+    elseif n >= 1e12 then
+        return string.format("%.2fT", n / 1e12)
+    elseif n >= 1e9 then
+        return string.format("%.2fB", n / 1e9)
+    elseif n >= 1e6 then
+        return string.format("%.2fM", n / 1e6)
+    elseif n >= 1e3 then
+        return string.format("%.2fK", n / 1e3)
+    else
+        return tostring(math.floor(n))
+    end
+end
+
+function KaitunUIService:FindParent()
+    local guiName = "Kaitun_Dashboard_UI"
+    local localPlayer = Players.LocalPlayer
+
+    local okCg, cg = pcall(function()
+        return (type(cloneref) == "function" and cloneref(game:GetService("CoreGui"))) or game:GetService("CoreGui")
+    end)
+    if okCg and cg then
+        if cg:FindFirstChild(guiName) then
+            cg[guiName]:Destroy()
+        end
+        return cg
+    end
+
+    local pg = localPlayer and (localPlayer:FindFirstChild("PlayerGui") or localPlayer:WaitForChild("PlayerGui", 5))
+    if pg then
+        if pg:FindFirstChild(guiName) then
+            pg[guiName]:Destroy()
+        end
+        return pg
+    end
+
+    return nil
+end
+
+function KaitunUIService:GetGoldAmount()
+    local ok, val = pcall(function()
+        return GameModules.StatsServiceClient.stats.gold_amount.Value
+    end)
+    if ok and type(val) == "number" then
+        return val
+    end
+    local session = GameModules.Session
+    if session and session.profile_data and session.profile_data.resources then
+        return session.profile_data.resources.gold_amount or 0
+    end
+    return 0
+end
+
+function KaitunUIService:GetPlayerXPProgress(level)
+    local player = Players.LocalPlayer
+    local totalXP = 0
+    pcall(function()
+        totalXP = player._stats.player_xp.Value
+    end)
+
+    local lvl = level or GameModules:GetPlayerLevel()
+    local curLvlBaseXP = 0
+    local nextLvlTotalXP = 100
+    pcall(function()
+        if GameModules.LevelServiceCore then
+            curLvlBaseXP = GameModules.LevelServiceCore.calculate_xp(player, lvl)
+            nextLvlTotalXP = GameModules.LevelServiceCore.calculate_xp(player, lvl + 1)
+        end
+    end)
+
+    local currentXPInLevel = math.max(0, math.floor(totalXP - curLvlBaseXP))
+    local requiredXPForNext = math.max(1, math.floor(nextLvlTotalXP - curLvlBaseXP))
+    return currentXPInLevel, requiredXPForNext
+end
+
+function KaitunUIService:GetUnitInventoryStats()
+    local totalUnits = 0
+    local mythicCount = 0
+    local secretCount = 0
+    local shinyCount = 0
+
+    local session = GameModules.Session
+    local ownedUnits = session
+        and session.collection
+        and session.collection.collection_profile_data
+        and session.collection.collection_profile_data.owned_units
+    local unitsData = GameModules.Units
+
+    if type(ownedUnits) == "table" then
+        for _, uObj in pairs(ownedUnits) do
+            totalUnits = totalUnits + 1
+            if uObj.shiny then
+                shinyCount = shinyCount + 1
+            end
+            local uDef = unitsData and unitsData[uObj.unit_id]
+            local rarity = uDef and uDef.rarity
+            if rarity == "Mythic" then
+                mythicCount = mythicCount + 1
+            elseif rarity == "Secret" then
+                secretCount = secretCount + 1
+            end
+        end
+    end
+
+    return totalUnits, mythicCount, secretCount, shinyCount
+end
+
+function KaitunUIService:GetCodeStats()
+    local totalCodes = (type(Config.Codes) == "table" and #Config.Codes) or 0
+    local redeemedCount = 0
+    if type(Config.Codes) == "table" then
+        for _, entry in ipairs(Config.Codes) do
+            local code = CodeService:NormalizeEntry(entry)
+            if code and CodeService:IsCodeRedeemed(code) then
+                redeemedCount = redeemedCount + 1
+            end
+        end
+    end
+    return redeemedCount, totalCodes
+end
+
+function KaitunUIService:GetZoneProgressText()
+    local isLobby = GameModules.Loader and GameModules.Loader.IsLobby
+    if isLobby then
+        return string.format("Zone: Lobby  |  Banner: %s  |  Target Farm Lv: %d", tostring(Config.SummonBanner or "EventClover"), tonumber(Config.TargetFarmLevel) or 20)
+    end
+
+    local levelData = GameModules.Loader and GameModules.Loader.LevelData
+    local levelVal = (levelData and levelData.id) or tostring(Config.FarmLevel or "namek_level_6")
+    local waveNum = workspace:FindFirstChild("_wave_num") and workspace._wave_num.Value or 0
+    local bases = workspace:FindFirstChild("_BASES")
+    local baseNode = bases and bases:FindFirstChild("player") and bases.player:FindFirstChild("base") and bases.player.base:FindFirstChild("fake_unit")
+    local baseHum = baseNode and baseNode:FindFirstChild("Humanoid")
+    local hpText = baseHum and string.format("%d/%d", math.max(0, math.floor(baseHum.Health)), math.floor(baseHum.MaxHealth)) or "---"
+
+    return string.format("Zone: In-Game (%s)  |  Wave: %d  |  Base HP: %s", tostring(levelVal), tonumber(waveNum) or 0, hpText)
+end
+
+function KaitunUIService:Create()
+    if Config.ShowKaitunUI == false then
+        return
+    end
+
+    local parent = self:FindParent()
+    if not parent then
+        return
+    end
+
+    local guiName = "Kaitun_Dashboard_UI"
+    local localPlayer = Players.LocalPlayer
+
+    local C_GOLD   = Color3.fromRGB(255, 170, 0)
+    local C_DIM    = Color3.fromRGB(200, 205, 220)
+    local C_WHITE  = Color3.new(1, 1, 1)
+    local C_GREEN  = Color3.fromRGB(80, 220, 120)
+    local C_PURPLE = Color3.fromRGB(180, 150, 255)
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = guiName
+    sg.DisplayOrder = 999999
+    sg.ResetOnSpawn = false
+    sg.IgnoreGuiInset = true
+    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    sg.Parent = parent
+    self.ScreenGui = sg
+
+    local bg = Instance.new("Frame")
+    bg.Size = UDim2.new(1, 0, 1, 0)
+    bg.BackgroundColor3 = Color3.new(0, 0, 0)
+    bg.BackgroundTransparency = 0
+    bg.BorderSizePixel = 0
+    bg.ZIndex = 999
+    bg.Parent = sg
+
+    local container = Instance.new("Frame")
+    container.Size = UDim2.new(1, 0, 0, 310)
+    container.AnchorPoint = Vector2.new(0.5, 0.5)
+    container.Position = UDim2.new(0.5, 0, 0.5, 0)
+    container.BackgroundTransparency = 1
+    container.BorderSizePixel = 0
+    container.ZIndex = 1000
+    container.Parent = sg
+
+    local function MkText(parentObj, text, size, color, bold, yPos, h)
+        local l = Instance.new("TextLabel")
+        l.Size = UDim2.new(1, 0, 0, h or (size + 6))
+        l.Position = UDim2.new(0, 0, 0, yPos)
+        l.BackgroundTransparency = 1
+        l.Text = text
+        l.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+        l.TextSize = size
+        l.TextColor3 = color or C_WHITE
+        l.TextXAlignment = Enum.TextXAlignment.Center
+        l.TextYAlignment = Enum.TextYAlignment.Center
+        l.ZIndex = 1000
+        l.Parent = parentObj
+        return l
+    end
+
+    local function MkSep(parentObj, yPos)
+        local s = Instance.new("Frame")
+        s.Size = UDim2.new(0, 460, 0, 2)
+        s.Position = UDim2.new(0.5, -230, 0, yPos)
+        s.BackgroundColor3 = C_GOLD
+        s.BackgroundTransparency = 0.4
+        s.BorderSizePixel = 0
+        s.ZIndex = 1000
+        s.Parent = parentObj
+    end
+
+    local playerName = (localPlayer and localPlayer.Name) or "Player"
+    if Config.WebhookHideUsername then
+        playerName = string.sub(playerName, 1, 3) .. "***"
+    end
+
+    local lblName     = MkText(container, playerName, 44, C_GOLD, true, 0, 50)
+    MkSep(container, 65)
+    local lblTime     = MkText(container, "Session Time: 00:00:00", 24, C_WHITE, true, 80, 32)
+    local lblCurrency = MkText(container, "Gems: 0  |  Gold: 0  |  Level: 1 (XP: 0/100)", 22, C_GOLD, true, 120, 32)
+    local lblTickets  = MkText(container, "Summon Tickets: 0  |  Target Farm Level: 50", 22, C_GREEN, true, 160, 30)
+    local lblUnits    = MkText(container, "Units Owned: 0  |  Mythic: 0  |  Secret: 0  |  Shiny: 0", 18, C_DIM, false, 198, 28)
+    local lblZone     = MkText(container, "Zone: Initializing...", 18, C_DIM, false, 230, 28)
+    local lblCodes    = MkText(container, "Codes Redeemed: 0/6", 17, C_PURPLE, false, 262, 27)
+    MkSep(container, 305)
+
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Size = UDim2.new(0, 36, 0, 36)
+    toggleBtn.Position = UDim2.new(1, -48, 0, 10)
+    toggleBtn.BackgroundColor3 = Color3.fromRGB(30, 25, 50)
+    toggleBtn.BorderSizePixel = 0
+    toggleBtn.Text = "-"
+    toggleBtn.TextSize = 22
+    toggleBtn.Font = Enum.Font.GothamBold
+    toggleBtn.TextColor3 = C_WHITE
+    toggleBtn.ZIndex = 1001
+    toggleBtn.Parent = sg
+
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(0, 6)
+    btnCorner.Parent = toggleBtn
+
+    self.IsHidden = false
+    if Config.Disable3DRenderingWhenUIShown then
+        pcall(function()
+            game:GetService("RunService"):Set3dRenderingEnabled(false)
+        end)
+    end
+
+    toggleBtn.MouseButton1Click:Connect(function()
+        self.IsHidden = not self.IsHidden
+        container.Visible = not self.IsHidden
+        bg.Visible = not self.IsHidden
+        toggleBtn.Text = self.IsHidden and "+" or "-"
+
+        pcall(function()
+            if Config.Disable3DRenderingInMatch and GameModules.Loader and not GameModules.Loader.IsLobby then
+                game:GetService("RunService"):Set3dRenderingEnabled(false)
+            elseif Config.Disable3DRenderingWhenUIShown then
+                game:GetService("RunService"):Set3dRenderingEnabled(self.IsHidden)
+            else
+                game:GetService("RunService"):Set3dRenderingEnabled(true)
+            end
+        end)
+    end)
+
+    task.spawn(function()
+        while sg and sg.Parent do
+            pcall(function()
+                local startTime = (type(getgenv) == "function" and getgenv()._KaitunStartTime) or os.time()
+                lblTime.Text = "Session Time: " .. self:FormatTime(os.time() - startTime)
+
+                if GameModules.Initialized then
+                    local gems = GameModules:GetGemAmount()
+                    local gold = self:GetGoldAmount()
+                    local lvl = GameModules:GetPlayerLevel()
+                    local curXP, nextXP = self:GetPlayerXPProgress(lvl)
+                    local tickets = SummonService:GetSummonTicketCount()
+                    local totalU, mythicU, secretU, shinyU = self:GetUnitInventoryStats()
+                    local redeemedC, totalC = self:GetCodeStats()
+
+                    lblCurrency.Text = string.format(
+                        "Gems: %s  |  Gold: %s  |  Level: %d (XP: %d/%d)",
+                        self:FormatCompactNumber(gems),
+                        self:FormatCompactNumber(gold),
+                        lvl,
+                        curXP,
+                        nextXP
+                    )
+                    lblTickets.Text = string.format(
+                        "Summon Tickets: %d  |  Target Farm Level: %d",
+                        tickets,
+                        tonumber(Config.TargetFarmLevel) or 20
+                    )
+                    lblUnits.Text = string.format(
+                        "Units Owned: %d  |  Mythic: %d  |  Secret: %d  |  Shiny: %d",
+                        totalU,
+                        mythicU,
+                        secretU,
+                        shinyU
+                    )
+                    lblZone.Text = self:GetZoneProgressText()
+                    lblCodes.Text = string.format(
+                        "Codes Redeemed: %d/%d",
+                        redeemedC,
+                        totalC
+                    )
+                end
+            end)
+            task.wait(0.5)
+        end
+    end)
+
+    log("KaitunUIService initialized")
+end
+
+-- ============================================================================
+-- UNIT IMAGE CDN TABLE (503 Mapped Playable Units)
+-- ============================================================================
+UnitImages.Map = {
+    ["ace"] = "https://static.wikia.nocookie.net/animeadventures/images/a/ad/Fire_Fist.png/revision/latest",
+    ["ainz"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d1/Supreme_Being.png/revision/latest",
+    ["ainz_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/26/Supreme_Being_%28Sovereign%29.png/revision/latest",
+    ["aizen"] = "https://static.wikia.nocookie.net/animeadventures/images/a/af/Illusionist.png/revision/latest",
+    ["aizen_christmas"] = "https://static.wikia.nocookie.net/animeadventures/images/f/fa/Illusionist_%28Transcended%29.png/revision/latest",
+    ["aizen_chrys"] = "https://static.wikia.nocookie.net/animeadventures/images/1/18/Illusionist_%28Chrysalis%29.png/revision/latest",
+    ["aizen_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c5/Illusionist_%28Betrayal%29.png/revision/latest",
+    ["aizen_hog"] = "https://static.wikia.nocookie.net/animeadventures/images/2/25/Illusionist_%28Fusion%29.png/revision/latest",
+    ["aizen_hog_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b7/Illusionist_%28Final%29.png/revision/latest",
+    ["akainu"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f9/Magma.png/revision/latest",
+    ["akainu_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/6f/Fleet_Admiral_Magma.png/revision/latest",
+    ["akaza_unit"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3e/Martial_Demon.png/revision/latest",
+    ["akaza_unit_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/7a/Martial_Demon_%28Destruction%29.png/revision/latest",
+    ["akeno"] = "https://static.wikia.nocookie.net/animeadventures/images/b/ba/Akemy.png/revision/latest",
+    ["akeno_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/71/Akemy_%28Fallen_Angel%29.png/revision/latest",
+    ["aki"] = "https://static.wikia.nocookie.net/animeadventures/images/8/85/Curse.png/revision/latest",
+    ["aki_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/f/fc/Curse_%28Contract%29.png/revision/latest",
+    ["akutagawa"] = "https://static.wikia.nocookie.net/animeadventures/images/c/cd/Black_Dog.png/revision/latest",
+    ["akutagawa_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/58/Black_Dog_%28HellHound%29.png/revision/latest",
+    ["albedo"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4f/Cherub.png/revision/latest",
+    ["albedo_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f0/Cherub_%28Overseer%29.png/revision/latest",
+    ["all_might"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a4/Prime_Force.png/revision/latest",
+    ["all_might_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b4/Prime_Force_%28Peace%29.png/revision/latest",
+    ["alucard"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8f/Dracula.png/revision/latest",
+    ["alucard_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8f/Dracula.png/revision/latest",
+    ["android21"] = "https://static.wikia.nocookie.net/animeadventures/images/0/06/Android_AAA.png/revision/latest",
+    ["angel_devil"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1e/Paragon.png/revision/latest",
+    ["angel_devil_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/31/Paragon_%28Devil%29.png/revision/latest",
+    ["aokiji"] = "https://static.wikia.nocookie.net/animeadventures/images/5/58/Frost_Navy.png/revision/latest",
+    ["aokiji_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/15/Frost_Navy_%28Blue_Pigeon%29.png/revision/latest",
+    ["archer"] = "https://static.wikia.nocookie.net/animeadventures/images/7/78/Faker.png/revision/latest",
+    ["archer_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/51/Faker_%28Hero%27s_Soul%29.png/revision/latest",
+    ["arima"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1f/Ariva.png/revision/latest",
+    ["arima_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c5/Ariva_%28Reaper%29.png/revision/latest",
+    ["armin"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d1/Arlem.png/revision/latest",
+    ["asta"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1f/Magic_Disbeliever.png/revision/latest",
+    ["asta_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/9/93/Magic_Disbeliever_%28Dark%29.png/revision/latest",
+    ["asuna"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3f/Gamer_Girl.png/revision/latest",
+    ["asuna_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b1/Gamer_Girl_%28Flash%29.png/revision/latest",
+    ["atsushi"] = "https://static.wikia.nocookie.net/animeadventures/images/a/ae/Tiger.png/revision/latest",
+    ["atsushi_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d3/Tiger_%28Moonlight_Beast%29.png/revision/latest",
+    ["avdol"] = "https://static.wikia.nocookie.net/animeadventures/images/6/66/Flamefeather.png/revision/latest",
+    ["avdol_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/61/Flamefeather_%28Arcane_Blaze%29.png/revision/latest",
+    ["bakugou"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8f/Explosion_Hero.png/revision/latest",
+    ["bakugou_2"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e4/Explosion_Hero_%28Bang%29.png/revision/latest",
+    ["bakugou_2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/70/Explosion_Hero_%28Impact%29.png/revision/latest",
+    ["bambietta"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c9/Bombietta.png/revision/latest",
+    ["ban"] = "https://static.wikia.nocookie.net/animeadventures/images/1/10/Crimson_Thief.png/revision/latest",
+    ["ban_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/ac/Crimson_Thief_%28Hunt%29.png/revision/latest",
+    ["bang"] = "https://static.wikia.nocookie.net/animeadventures/images/c/cb/Waterfist.png/revision/latest",
+    ["bang_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c0/Waterfist_%28White_Tooth%29.png/revision/latest",
+    ["bee_girl"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c6/Honey.png/revision/latest",
+    ["bee_girl_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/cb/Honey_%28Hive%29.png/revision/latest",
+    ["blackbeard"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0a/Blackhair.png/revision/latest",
+    ["boa"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0a/Snake_Princess.png/revision/latest",
+    ["boros"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0a/Alien_King.png/revision/latest",
+    ["boros_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1b/Lord_Alien_King.png/revision/latest",
+    ["boxxo"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a6/Dispenser.png/revision/latest",
+    ["broly"] = "https://static.wikia.nocookie.net/animeadventures/images/5/5c/Bro.png/revision/latest",
+    ["broly_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/d/db/Super_Bro.png/revision/latest",
+    ["brook"] = "https://static.wikia.nocookie.net/animeadventures/images/2/23/Skeleton.png/revision/latest",
+    ["brook_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2d/Skeleton_%28Soul_King%29.png/revision/latest",
+    ["buddha"] = "https://static.wikia.nocookie.net/animeadventures/images/f/fd/Enlightened.png/revision/latest",
+    ["buddha_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/36/Enlightened_%28Nirvana%29.png/revision/latest",
+    ["buggy"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4d/Stitches.png/revision/latest",
+    ["bulma"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e3/Bulby.png/revision/latest",
+    ["buu"] = "https://static.wikia.nocookie.net/animeadventures/images/0/02/Bubblegum.png/revision/latest",
+    ["buu_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3d/Bubblegum_%28Ultimate%29.png/revision/latest",
+    ["caesar"] = "https://static.wikia.nocookie.net/animeadventures/images/3/33/Julias.png/revision/latest",
+    ["caesarclown"] = "https://static.wikia.nocookie.net/animeadventures/images/7/78/Gas.png/revision/latest",
+    ["caesarclown_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c0/Gas_%28Toxic%29.png/revision/latest",
+    ["carrot"] = "https://static.wikia.nocookie.net/animeadventures/images/8/82/Bunny.png/revision/latest",
+    ["carrot_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/73/Bunny_%28Night%29.png/revision/latest",
+    ["cell_imperfect"] = "https://static.wikia.nocookie.net/animeadventures/images/7/7e/Experiment_X_%28Imperfect%29.png/revision/latest",
+    ["cell_perfect"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8b/Experiment_X_%28Perfect%29.png/revision/latest",
+    ["cell_semi_perfect"] = "https://static.wikia.nocookie.net/animeadventures/images/b/bf/Experiment_X_%28Semi-Perfect%29.png/revision/latest",
+    ["cell_super_perfect"] = "https://static.wikia.nocookie.net/animeadventures/images/5/58/Experiment_X_%28SUPER_PERFECT%29.png/revision/latest",
+    ["chad"] = "https://static.wikia.nocookie.net/animeadventures/images/f/fa/Brawler.png/revision/latest",
+    ["chad_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/01/Brawler_%28Soul%29.png/revision/latest",
+    ["charmy"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c3/Cotton.png/revision/latest",
+    ["charmy_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4f/Cotton_%28Sheep%29.png/revision/latest",
+    ["chihiro"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3b/Vengeful_Swordsman.png/revision/latest",
+    ["chihiro_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/55/Vengeful_Swordsman_%28Sky_Reaver%29.png/revision/latest",
+    ["chika"] = "https://static.wikia.nocookie.net/animeadventures/images/9/92/Spirit_Sniper.png/revision/latest",
+    ["chika_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/05/Spirit_Sniper_%28Prodigy%29.png/revision/latest",
+    ["chuya"] = "https://static.wikia.nocookie.net/animeadventures/images/6/6d/Gravity_Mage.png/revision/latest",
+    ["chuya_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0c/Gravity_Mage_%28Void%29.png/revision/latest",
+    ["cid"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a2/Umbra.png/revision/latest",
+    ["cid_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2e/Umbra_%28Nuclear%29.png/revision/latest",
+    ["conrad"] = "https://static.wikia.nocookie.net/animeadventures/images/4/44/Connor.png/revision/latest",
+    ["conrad_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/4/44/Connor_%28Wizard_King%29.png/revision/latest",
+    ["cooler"] = "https://static.wikia.nocookie.net/animeadventures/images/6/66/Fridge.png/revision/latest",
+    ["cranel"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0c/Player.png/revision/latest",
+    ["cranel_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d6/Player_%28Argus%29.png/revision/latest",
+    ["dabi"] = "https://static.wikia.nocookie.net/animeadventures/images/0/06/Scorch.png/revision/latest",
+    ["daki"] = "https://static.wikia.nocookie.net/animeadventures/images/9/96/Saka.png/revision/latest",
+    ["daki_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/39/Saka_%28Ribbon%29.png/revision/latest",
+    ["dazai"] = "https://static.wikia.nocookie.net/animeadventures/images/9/9a/InHuman.png/revision/latest",
+    ["dazai_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4b/InHuman_%28Nullifier%29.png/revision/latest",
+    ["deku"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3a/Verdant_Hero.png/revision/latest",
+    ["deku_vigilante"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a7/Verdant_Hero_%28String%29.png/revision/latest",
+    ["deku_vigilante_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/73/Verdant_Hero_%28Dark%29.png/revision/latest",
+    ["demiurge"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f1/Lucifer.png/revision/latest",
+    ["demiurge_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0b/Lucifer_%28Demon_Emperor%29.png/revision/latest",
+    ["denji"] = "https://static.wikia.nocookie.net/animeadventures/images/0/03/Blade_Beast.png/revision/latest",
+    ["denji_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3d/Blade_Beast_%28Hybrid%29.png/revision/latest",
+    ["denji_secret"] = "https://static.wikia.nocookie.net/animeadventures/images/3/38/Blade_Beast_%28Past%29.png/revision/latest",
+    ["diane"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0e/Hammer_Giantess.png/revision/latest",
+    ["diane_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/19/Hammer_Giantess_%28Creation%29.png/revision/latest",
+    ["diavolo"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e8/Devil_Boss.png/revision/latest",
+    ["dio_heaven"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d4/JIO_%28Over_Heaven%29.png/revision/latest",
+    ["doflamingo"] = "https://static.wikia.nocookie.net/animeadventures/images/e/ef/Stringy.png/revision/latest",
+    ["doflamingo_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e8/Stringy_%28Awakened%29.png/revision/latest",
+    ["dokuro"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a6/Violentine.png/revision/latest",
+    ["dokuro_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/74/Violentine_%28Brutal_Angel%29.png/revision/latest",
+    ["dominico"] = "https://static.wikia.nocookie.net/animeadventures/images/d/df/Weather.png/revision/latest",
+    ["dominico_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/67/Heavy_Weather.png/revision/latest",
+    ["elyssia"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d4/Elyssia.png/revision/latest",
+    ["elyssia_eel"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d4/Elyssia.png/revision/latest",
+    ["elyssia_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/cb/Elyssia_%28Abyssal%29.png/revision/latest",
+    ["emilia"] = "https://static.wikia.nocookie.net/animeadventures/images/4/45/Ice_Lily.png/revision/latest",
+    ["endeavor"] = "https://static.wikia.nocookie.net/animeadventures/images/9/94/Flame_Hero.png/revision/latest",
+    ["endeavor_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3d/Flame_Hero_%28Hellfire%29.png/revision/latest",
+    ["eren_final"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f9/Usurper_%28Founder%29.png/revision/latest",
+    ["ermes"] = "https://static.wikia.nocookie.net/animeadventures/images/9/9d/Hermy.png/revision/latest",
+    ["ermes_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/20/Hermy_%28Duplicate%29.png/revision/latest",
+    ["erwin"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2e/Commander.png/revision/latest",
+    ["erza"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c9/Elize.png/revision/latest",
+    ["erza_evolved__placeholder"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c9/Elize.png/revision/latest",
+    ["erza_lightning"] = "https://static.wikia.nocookie.net/animeadventures/images/d/dd/Unknown.png/revision/latest",
+    ["erza_samurai"] = "https://static.wikia.nocookie.net/animeadventures/images/4/46/Elize_%28True_Heart%29.png/revision/latest",
+    ["erza_valkyrie"] = "https://static.wikia.nocookie.net/animeadventures/images/3/34/Elize_%28Valkyrie%29.png/revision/latest",
+    ["escanor"] = "https://static.wikia.nocookie.net/animeadventures/images/d/dd/Unknown.png/revision/latest",
+    ["escanor_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/66/Hubris_%28The_One%29.png/revision/latest",
+    ["escanor_weak"] = "https://static.wikia.nocookie.net/animeadventures/images/c/ce/Hubris_%28Night%29.png/revision/latest",
+    ["esdeath"] = "https://static.wikia.nocookie.net/animeadventures/images/9/9f/Ice_Queen.png/revision/latest",
+    ["esdeath_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/7e/Ice_Queen_%28Empire%27s_Strongest%29.png/revision/latest",
+    ["eto"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b3/Eta.png/revision/latest",
+    ["eto_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b8/Eta_%28One-Eye%29.png/revision/latest",
+    ["evileye"] = "https://static.wikia.nocookie.net/animeadventures/images/4/42/Crystal_Rose.png/revision/latest",
+    ["evileye_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/cb/Crystal_Rose_%28Impact%29.png/revision/latest",
+    ["feitan"] = "https://static.wikia.nocookie.net/animeadventures/images/8/84/Spider.png/revision/latest",
+    ["feitan_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d3/Spider_%28Immolation%29.png/revision/latest",
+    ["femto"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2a/Griffin_%28Darkness%29.png/revision/latest",
+    ["femto_egg"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a5/Griffin_%28Ascension%29.png/revision/latest",
+    ["frieren"] = "https://static.wikia.nocookie.net/animeadventures/images/5/5b/Elf_Mage.png/revision/latest",
+    ["frieren_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2d/Elf_Mage_%28Aura%29.png/revision/latest",
+    ["frieza_golden"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4c/Golden_Tyrant.png/revision/latest",
+    ["frieza_golden_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/ef/Golden_Tyrant_%28Emperor%29.png/revision/latest",
+    ["fugo"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e8/Haze.png/revision/latest",
+    ["fugo_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1a/Haze_%28Rage%29.png/revision/latest",
+    ["fujitora"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8b/Gravity_Navy.png/revision/latest",
+    ["fujitora_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/5f/Gravity_Navy_%28Admiral%29.png/revision/latest",
+    ["future_gohan"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b1/Future_Goh.png/revision/latest",
+    ["gabimaru"] = "https://static.wikia.nocookie.net/animeadventures/images/8/87/Flower_Ninja.png/revision/latest",
+    ["gabimaru_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/70/Flower_Ninja_%28Austere_Flame%29.png/revision/latest",
+    ["gaku"] = "https://static.wikia.nocookie.net/animeadventures/images/3/33/Killstreak.png/revision/latest",
+    ["gaku_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2e/Killstreak_%28Speedrun%29.png/revision/latest",
+    ["genos_2"] = "https://static.wikia.nocookie.net/animeadventures/images/e/ed/Cyborg_%28Overdrive%29.png/revision/latest",
+    ["genos_2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/65/Cyborg_%28Incinerate%29.png/revision/latest",
+    ["geten"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8b/Ice_Shaper.png/revision/latest",
+    ["geto"] = "https://static.wikia.nocookie.net/animeadventures/images/0/04/Gazu.png/revision/latest",
+    ["geto_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4e/Gazu_%28Maximum%29.png/revision/latest",
+    ["ghiaccio"] = "https://static.wikia.nocookie.net/animeadventures/images/3/39/Skater.png/revision/latest",
+    ["ghiaccio_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2f/Skater_%28Album%29.png/revision/latest",
+    ["ghostkun"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b0/Ghost-kun.png/revision/latest",
+    ["ghostkun_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/8/88/Ghost-kun_%28Bound%29.png/revision/latest",
+    ["gildarts"] = "https://static.wikia.nocookie.net/animeadventures/images/1/15/Crush.png/revision/latest",
+    ["gildarts_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b1/Crush_%28Ace%29.png/revision/latest",
+    ["gilgamesh"] = "https://static.wikia.nocookie.net/animeadventures/images/5/53/Golden_King.png/revision/latest",
+    ["gilgamesh_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/ec/Golden_King_%28Lord_of_Heroes%29.png/revision/latest",
+    ["gin"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e6/White_Snake.png/revision/latest",
+    ["gin_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/35/White_Snake_%28Sacred_Spear%29.png/revision/latest",
+    ["giselle"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c3/Zombie.png/revision/latest",
+    ["giselle_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/6d/Zombie_%28Risen%29.png/revision/latest",
+    ["gogeta_failed"] = "https://static.wikia.nocookie.net/animeadventures/images/c/cf/%3F%3F%3F.png/revision/latest",
+    ["gogeta_failed__placeholder"] = "https://static.wikia.nocookie.net/animeadventures/images/c/cf/%3F%3F%3F.png/revision/latest",
+    ["gojo"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b0/Paradox.png/revision/latest",
+    ["gojo_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3b/Paradox_%28Divine_Sight%29.png/revision/latest",
+    ["goku"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3d/Goko_Deployment_Card.png/revision/latest",
+    ["goku_ssj3"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0c/Carrot_%28Super_III%29.png/revision/latest",
+    ["goku_ssj3_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2d/Carrot_%28Ultra%29.png/revision/latest",
+    ["gon_adult"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a5/Gene_%28Adult%29.png/revision/latest",
+    ["gon_adult_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/10/%3F%3F%3F_%28Pose%29.png/revision/latest",
+    ["gowther"] = "https://static.wikia.nocookie.net/animeadventures/images/f/fb/Doll.png/revision/latest",
+    ["gowther_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/02/Doll_%28Spirit_Archer%29.png/revision/latest",
+    ["gray"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c6/Cold_Mage.png/revision/latest",
+    ["gray_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/ad/Cold_Mage_%28Devil_Slayer%29.png/revision/latest",
+    ["gremmy"] = "https://static.wikia.nocookie.net/animeadventures/images/2/29/Dreamer.png/revision/latest",
+    ["gremmy_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c0/Dreamer_%28Visionary%29.png/revision/latest",
+    ["griffith"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f8/Griffin.png/revision/latest",
+    ["griffith_reincarnation"] = "https://static.wikia.nocookie.net/animeadventures/images/5/51/Griffin_%28Reincarnation%29.png/revision/latest",
+    ["grimmjow_res"] = "https://static.wikia.nocookie.net/animeadventures/images/4/41/Iceclaw_%28Rebirth%29.png/revision/latest",
+    ["grimmjow_res_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3f/Iceclaw_%28Azure_Fang%29.png/revision/latest",
+    ["guts"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a8/Berserker.png/revision/latest",
+    ["guts_berserker"] = "https://static.wikia.nocookie.net/animeadventures/images/7/77/Berserker_%28Rage%29.png/revision/latest",
+    ["gyutaro"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b1/Sepsis.png/revision/latest",
+    ["gyutaro_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/63/Sepsis_%28Moon%29.png/revision/latest",
+    ["hakari"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8a/Gambler.png/revision/latest",
+    ["hakari_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/32/Gambler_%28Jackpot%29.png/revision/latest",
+    ["haku"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c7/Mirror_Ninja.png/revision/latest",
+    ["haku_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/55/Mirror_Ninja_%28Reflection%29.png/revision/latest",
+    ["hange"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4e/Eccentric_Researcher.png/revision/latest",
+    ["hange_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f3/Eccentric_Researcher_%28Captain%29.png/revision/latest",
+    ["harribel"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e1/Hammerhead.png/revision/latest",
+    ["harribel_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/71/Hammerhead_%28Shark_Empress%29.png/revision/latest",
+    ["hawks"] = "https://static.wikia.nocookie.net/animeadventures/images/0/06/Falcon.png/revision/latest",
+    ["hawks_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/36/Falcon_%28Feather_Strike%29.png/revision/latest",
+    ["heathcliff"] = "https://static.wikia.nocookie.net/animeadventures/images/e/eb/Crusader.png/revision/latest",
+    ["heathcliff_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/9/9b/Crusader_%28Admin%29.png/revision/latest",
+    ["hei"] = "https://static.wikia.nocookie.net/animeadventures/images/5/50/Black_Assassin.png/revision/latest",
+    ["hei_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/9/9b/Black_Assassin_%28Reaper%29.png/revision/latest",
+    ["hidan_unit"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f5/Death_Ninja.png/revision/latest",
+    ["hidan_unit_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1f/Death_Ninja_%28Immortal_Butcher%29.png/revision/latest",
+    ["hiei"] = "https://static.wikia.nocookie.net/animeadventures/images/f/fe/Demonshade.png/revision/latest",
+    ["himeno"] = "https://static.wikia.nocookie.net/animeadventures/images/5/53/Ghosty.png/revision/latest",
+    ["himeno_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/02/Ghosty_%28Sacrifice%29.png/revision/latest",
+    ["hinami"] = "https://static.wikia.nocookie.net/animeadventures/images/9/95/Fiend_Girl.png/revision/latest",
+    ["hinami_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/d/dd/Unknown.png/revision/latest",
+    ["homura"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d9/Shadowgirl.png/revision/latest",
+    ["homura_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/b/be/Shadowgirl_%28Time_Traveller%29_%28Pose%29.png/revision/latest",
+    ["hoshino"] = "https://static.wikia.nocookie.net/animeadventures/images/0/07/Idol.png/revision/latest",
+    ["hoshino_2"] = "https://static.wikia.nocookie.net/animeadventures/images/0/07/Idol.png/revision/latest",
+    ["hoshino_2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/65/Idol_%28Star%29.png/revision/latest",
+    ["hoshino_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/65/Idol_%28Star%29.png/revision/latest",
+    ["ichigo"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b5/Ichi_Deployment_Card.png/revision/latest",
+    ["ichigo_hollow"] = "https://static.wikia.nocookie.net/animeadventures/images/4/45/Spirit_Reaper_%28Full_Hollow%29.png/revision/latest",
+    ["ichigo_mugetsu"] = "https://static.wikia.nocookie.net/animeadventures/images/3/36/Spirit_Reaper_%28Dusk%29.png/revision/latest",
+    ["ichigo_mugetsu_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/20/Spirit_Reaper_%28Final_Dusk%29.png/revision/latest",
+    ["illya"] = "https://static.wikia.nocookie.net/animeadventures/images/6/6c/Lilia.png/revision/latest",
+    ["illya_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/ce/Lilia_%28Homunculus%29.png/revision/latest",
+    ["inuyasha"] = "https://static.wikia.nocookie.net/animeadventures/images/4/47/Dog_Demon.png/revision/latest",
+    ["ippo"] = "https://static.wikia.nocookie.net/animeadventures/images/9/99/Boxer.png/revision/latest",
+    ["isagi"] = "https://static.wikia.nocookie.net/animeadventures/images/5/57/Messi.png/revision/latest",
+    ["issei"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4e/Dragon_Knight.png/revision/latest",
+    ["issei_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/5e/Dragon_Knight_%28Gauntlet%29.png/revision/latest",
+    ["itachi_2"] = "https://static.wikia.nocookie.net/animeadventures/images/a/ad/Izo_%28Black_Fire%29.png/revision/latest",
+    ["itachi_2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0a/Izo_%28Samurai%29.png/revision/latest",
+    ["itadori"] = "https://static.wikia.nocookie.net/animeadventures/images/c/cd/Itukoda.png/revision/latest",
+    ["izumi"] = "https://static.wikia.nocookie.net/animeadventures/images/0/02/Scarlet_Slayer.png/revision/latest",
+    ["izumi_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4d/Scarlet_Slayer_%28Cursed_Frost%29.png/revision/latest",
+    ["jellal"] = "https://static.wikia.nocookie.net/animeadventures/images/0/05/Jelly.png/revision/latest",
+    ["jellal_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/6a/Jelly_%28Heaven%29.png/revision/latest",
+    ["jin_mori"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b0/Wukong.png/revision/latest",
+    ["jiraiya"] = "https://static.wikia.nocookie.net/animeadventures/images/c/cd/Toad_Sensei.png/revision/latest",
+    ["jiraiya_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/17/Toad_Sensei_%28Toad_Sage%29.png/revision/latest",
+    ["jolyne"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0b/Dolphin.png/revision/latest",
+    ["jolyne_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2b/Dolphin_%28Determination%29.png/revision/latest",
+    ["josuke"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2b/Josuka_Deployment_Card.png/revision/latest",
+    ["josuke_2"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b2/Jose_%28Shining_Gem%29.png/revision/latest",
+    ["josuke_2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a0/Jose_%28Unbreakable%29.png/revision/latest",
+    ["jotaro_p6"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c9/Delinquent_%28Serious%29.png/revision/latest",
+    ["jotaro_p6_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/ef/Delinquent_%28The_Universe%29.png/revision/latest",
+    ["jozu"] = "https://static.wikia.nocookie.net/animeadventures/images/f/ff/Bozo.png/revision/latest",
+    ["judar"] = "https://static.wikia.nocookie.net/animeadventures/images/3/33/Dark_Mage.png/revision/latest",
+    ["judar_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/8/84/Dark_Mage_%28Fallen_Star%29.png/revision/latest",
+    ["julius"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b9/Time_Wizard.png/revision/latest",
+    ["julius_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e3/Time_Wizard_%28Chronos%29.png/revision/latest",
+    ["juuzou"] = "https://static.wikia.nocookie.net/animeadventures/images/3/38/Juozu.png/revision/latest",
+    ["juuzou_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a5/Juozu_%28Joker%29.png/revision/latest",
+    ["katakuri"] = "https://static.wikia.nocookie.net/animeadventures/images/4/45/Mochi.png/revision/latest",
+    ["katakuri_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1e/Mochi_%28Rage%29.png/revision/latest",
+    ["kenpachi"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d6/Packy.png/revision/latest",
+    ["kenpachi_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8a/Packy_%28Maniac%29.png/revision/latest",
+    ["kenshin"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e9/Katana.png/revision/latest",
+    ["kento"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b5/Ratio.png/revision/latest",
+    ["kento_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c3/Ratio_%28Overtime%29.png/revision/latest",
+    ["killua"] = "https://static.wikia.nocookie.net/animeadventures/images/2/22/Kizzua_Deployment_Card.png/revision/latest",
+    ["killua_godspeed"] = "https://static.wikia.nocookie.net/animeadventures/images/9/91/Killer_%28Whirlwind%29.png/revision/latest",
+    ["killua_godspeed_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/7d/Killer_%28Godspeed%29.png/revision/latest",
+    ["kimimaro"] = "https://static.wikia.nocookie.net/animeadventures/images/9/9c/Kimoaro.png/revision/latest",
+    ["king_7ds"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e5/Fairy_Ruler.png/revision/latest",
+    ["king_7ds_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/ee/Fairy_Ruler_%28Sloth%29.png/revision/latest",
+    ["kira"] = "https://static.wikia.nocookie.net/animeadventures/images/7/77/Calm_Killer.png/revision/latest",
+    ["kira_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/06/Calm_Killer_%28Meets_the_End%29.png/revision/latest",
+    ["kirito"] = "https://static.wikia.nocookie.net/animeadventures/images/0/06/Gamer.png/revision/latest",
+    ["kirito_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3c/Gamer_%28Dual%29.png/revision/latest",
+    ["kisame_unit"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1f/Sharkfin.png/revision/latest",
+    ["kisame_unit_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4e/Sharkfin_%28Tailless_Beast%29.png/revision/latest",
+    ["kisuke"] = "https://static.wikia.nocookie.net/animeadventures/images/b/bd/Trickster.png/revision/latest",
+    ["kisuke_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/9/90/Trickster_%28Release%29.png/revision/latest",
+    ["kite"] = "https://static.wikia.nocookie.net/animeadventures/images/5/57/Chance.png/revision/latest",
+    ["kite_evolved__placeholder"] = "https://static.wikia.nocookie.net/animeadventures/images/5/57/Chance.png/revision/latest",
+    ["kite_evolved_focus"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4a/Chance_%28Focus%29.png/revision/latest",
+    ["kite_evolved_frenzy"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e1/Chance_%28Frenzy%29.png/revision/latest",
+    ["kite_evolved_lethal"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2b/Chance_%28Lethal%29.png/revision/latest",
+    ["kite_evolved_precision"] = "https://static.wikia.nocookie.net/animeadventures/images/9/97/Chance_%28Precision%29.png/revision/latest",
+    ["klein"] = "https://static.wikia.nocookie.net/animeadventures/images/4/46/Virtual_Samurai.png/revision/latest",
+    ["klein_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c9/Virtual_Samurai_%28Bachelor%29.png/revision/latest",
+    ["kobeni"] = "https://static.wikia.nocookie.net/animeadventures/images/2/23/Cowardly.png/revision/latest",
+    ["kobeni_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/32/Cowardly_%28Scared%29.png/revision/latest",
+    ["koichi"] = "https://static.wikia.nocookie.net/animeadventures/images/e/ef/Reliable_Student.png/revision/latest",
+    ["koichi_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a8/Reliable_Student_%28Echoes%29.png/revision/latest",
+    ["konan_unit"] = "https://static.wikia.nocookie.net/animeadventures/images/5/50/Origami.png/revision/latest",
+    ["konan_unit_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/ed/Origami_%28Paper_Angel%29.png/revision/latest",
+    ["koneko"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0e/Catgirl.png/revision/latest",
+    ["koneko_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/24/Catgirl_%28Hell-Cat%29.png/revision/latest",
+    ["kuma_unit"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c7/Komo.png/revision/latest",
+    ["kyoko"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e4/Kyko.png/revision/latest",
+    ["kyoko_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/7e/Kyko_%28Crimson_Spear%29.png/revision/latest",
+    ["lancer"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d1/Spearer.png/revision/latest",
+    ["lancer_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/15/Spearer_%28Child_of_Light%29.png/revision/latest",
+    ["law_2"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0a/Operator_%28Heart%29.png/revision/latest",
+    ["law_2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/b/bf/Operator_%28ROOM%29.png/revision/latest",
+    ["leafa"] = "https://static.wikia.nocookie.net/animeadventures/images/0/00/Elfy.png/revision/latest",
+    ["leafa_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/66/Elfy_%28Sylph%29.png/revision/latest",
+    ["lelouch"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1f/Lulu.png/revision/latest",
+    ["lelouch_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e9/Lulu_%28Emperor%29.png/revision/latest",
+    ["levi"] = "https://static.wikia.nocookie.net/animeadventures/images/6/6f/Lex.png/revision/latest",
+    ["levi_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a7/Lex_Akoman.png/revision/latest",
+    ["luck"] = "https://static.wikia.nocookie.net/animeadventures/images/a/af/Karma.png/revision/latest",
+    ["luck_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/8/87/Karma_%28Thunder_Fiend%29.png/revision/latest",
+    ["lucy"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4c/Lyla.png/revision/latest",
+    ["lucy_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/01/Lyla_%28Celestial%29.png/revision/latest",
+    ["luffy_g4"] = "https://static.wikia.nocookie.net/animeadventures/images/2/25/Joykid_%28Bounce%29.png/revision/latest",
+    ["luffy_g4_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/04/Joykid_%28Mode_IV%29.png/revision/latest",
+    ["luffy_nightmare"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1b/Nightmare_Joykid.png/revision/latest",
+    ["madara"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8b/Mazara.png/revision/latest",
+    ["madara_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/b/ba/Mazara_%28Founder%29.png/revision/latest",
+    ["madoka"] = "https://static.wikia.nocookie.net/animeadventures/images/1/10/Magic_Girl.png/revision/latest",
+    ["madoka_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/10/Magic_Girl.png/revision/latest",
+    ["mahoraga"] = "https://static.wikia.nocookie.net/animeadventures/images/d/dd/Unknown.png/revision/latest",
+    ["mami"] = "https://static.wikia.nocookie.net/animeadventures/images/0/04/Millie.png/revision/latest",
+    ["mami_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/68/Millie_%28Holy%29.png/revision/latest",
+    ["mash"] = "https://static.wikia.nocookie.net/animeadventures/images/6/60/Bodybuilder.png/revision/latest",
+    ["mash_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2e/Bodybuilder_%28Muscles%29.png/revision/latest",
+    ["mechamaru"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f8/Robot_Sorceror.png/revision/latest",
+    ["medea"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2c/Hex.png/revision/latest",
+    ["medea_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/52/Hex_%28Witch_of_Betrayal%29.png/revision/latest",
+    ["megumi"] = "https://static.wikia.nocookie.net/animeadventures/images/5/53/Shadow_Sorcerer.png/revision/latest",
+    ["megumi2"] = "https://static.wikia.nocookie.net/animeadventures/images/6/63/Shadow_Sorcerer_%28Incident%29.png/revision/latest",
+    ["megumi2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/30/Shadow_Sorcerer_%28Ritual%29.png/revision/latest",
+    ["megumi_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/79/Shadow_Sorcerer_%28Hybrid_Shadow%29.png/revision/latest",
+    ["meliodas"] = "https://static.wikia.nocookie.net/animeadventures/images/d/de/Wratho.png/revision/latest",
+    ["meliodas_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1b/Wratho_%28Assault%29.png/revision/latest",
+    ["merlin"] = "https://static.wikia.nocookie.net/animeadventures/images/b/bf/Infinity_Mage.png/revision/latest",
+    ["merlin_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1f/Infinity_Mage_%28Endless%29.png/revision/latest",
+    ["meruem"] = "https://static.wikia.nocookie.net/animeadventures/images/5/56/Ant.png/revision/latest",
+    ["meruem_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/19/King_Ant.png/revision/latest",
+    ["metal_knight"] = "https://static.wikia.nocookie.net/animeadventures/images/4/45/Iron_Knight.png/revision/latest",
+    ["metal_knight_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/34/Iron_Knight_%28Arsenal%29.png/revision/latest",
+    ["minato"] = "https://static.wikia.nocookie.net/animeadventures/images/6/61/Flash_Ninja.png/revision/latest",
+    ["mirko"] = "https://static.wikia.nocookie.net/animeadventures/images/3/36/Lunar_Hare.png/revision/latest",
+    ["mirko_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/7e/Lunar_Hare_%28Tiger%29.png/revision/latest",
+    ["monet"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0a/Siren.png/revision/latest",
+    ["monet_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/7d/Siren_%28Harpy%29.png/revision/latest",
+    ["moria"] = "https://static.wikia.nocookie.net/animeadventures/images/6/6b/Morbid.png/revision/latest",
+    ["moria_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a7/Morbid_%28Shadow_Lord%29.png/revision/latest",
+    ["nagumo"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2f/Switchblade.png/revision/latest",
+    ["nagumo_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/51/Switchblade_%28Deception%29.png/revision/latest",
+    ["nami"] = "https://static.wikia.nocookie.net/animeadventures/images/5/5d/Weather_Girl.png/revision/latest",
+    ["nami_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/34/Weather_Girl_%28Thief%29.png/revision/latest",
+    ["narberal"] = "https://static.wikia.nocookie.net/animeadventures/images/7/7a/Thunder_Maid.png/revision/latest",
+    ["narberal_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c3/Thunder_Maid_%28Servant%29.png/revision/latest",
+    ["naruto_6tails"] = "https://static.wikia.nocookie.net/animeadventures/images/d/df/Fox_Ninja_%28Six_Tails%29.png/revision/latest",
+    ["naruto_pts_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f7/Fox_Ninja_%28Beast_Cloak%29.png/revision/latest",
+    ["naruto_sage"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a8/Fox_Ninja_%28Sage%29.png/revision/latest",
+    ["natsu"] = "https://static.wikia.nocookie.net/animeadventures/images/6/64/Dragonslayer.png/revision/latest",
+    ["natsu_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/32/Dragonslayer_%28Lightning_Mode%29.png/revision/latest",
+    ["nejire"] = "https://static.wikia.nocookie.net/animeadventures/images/6/6e/Windspire.png/revision/latest",
+    ["netero"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d4/Prayer_Master.png/revision/latest",
+    ["netero_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/5e/Chairman_Prayer_Master.png/revision/latest",
+    ["noelle"] = "https://static.wikia.nocookie.net/animeadventures/images/8/87/Aquatic_Mage.png/revision/latest",
+    ["noelle_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/02/Aquatic_Mage_%28Valkyrie_Armor%29.png/revision/latest",
+    ["nokotan"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b8/Deer-tan.png/revision/latest",
+    ["obito"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e4/Toby.png/revision/latest",
+    ["osaka"] = "https://static.wikia.nocookie.net/animeadventures/images/a/ad/Kansai.png/revision/latest",
+    ["osaka_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/4/41/Kansai_%28Daydream%29.png/revision/latest",
+    ["osaragi"] = "https://static.wikia.nocookie.net/animeadventures/images/8/88/Somber.png/revision/latest",
+    ["osaragi_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/76/Somber_%28Buzzsaw%29.png/revision/latest",
+    ["overhaul"] = "https://static.wikia.nocookie.net/animeadventures/images/b/bf/Restructure.png/revision/latest",
+    ["pain_2"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3f/Agony_%28Path%29.png/revision/latest",
+    ["pain_2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c3/Agony_%28Divine%29.png/revision/latest",
+    ["perona"] = "https://static.wikia.nocookie.net/animeadventures/images/1/15/Ghost_Lady.png/revision/latest",
+    ["perona_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/25/Ghost_Lady_%28Princess%29.png/revision/latest",
+    ["piccolo_fused"] = "https://static.wikia.nocookie.net/animeadventures/images/a/ad/Green_Alien_%28Fusion%29.png/revision/latest",
+    ["piccolo_fused_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/72/Green_Alien_%28Nameless%29.png/revision/latest",
+    ["pitou"] = "https://static.wikia.nocookie.net/animeadventures/images/6/63/Cat_Guard.png/revision/latest",
+    ["pitou_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8c/Cat_Guard_%28Ballet%29.png/revision/latest",
+    ["poseidon"] = "https://static.wikia.nocookie.net/animeadventures/images/1/14/Sea_God.png/revision/latest",
+    ["poseidon_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/07/Sea_God_%28Tyrant_of_the_Seas%29.png/revision/latest",
+    ["power"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b5/Blood.png/revision/latest",
+    ["power_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/55/Blood_%28Unleashed%29.png/revision/latest",
+    ["pucci"] = "https://static.wikia.nocookie.net/animeadventures/images/1/14/Priest.png/revision/latest",
+    ["pucci_cmoon"] = "https://static.wikia.nocookie.net/animeadventures/images/2/27/Priest_%28New_Moon%29.png/revision/latest",
+    ["pucci_heaven"] = "https://static.wikia.nocookie.net/animeadventures/images/9/98/Priest_%28Heaven%29.png/revision/latest",
+    ["ragna"] = "https://static.wikia.nocookie.net/animeadventures/images/0/09/Silver_Slayer.png/revision/latest",
+    ["ragna_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8f/Silver_Slayer_%28Hunter%29.png/revision/latest",
+    ["rayleigh"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8a/Silver_King.png/revision/latest",
+    ["rengoku"] = "https://static.wikia.nocookie.net/animeadventures/images/9/9b/Donut.png/revision/latest",
+    ["rengoku_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/65/Donut_%28ABLAZE%29.png/revision/latest",
+    ["renji"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3d/Renzi.png/revision/latest",
+    ["rias"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2b/Riony.png/revision/latest",
+    ["rias_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/52/Riony_%28Devil_Princess%29.png/revision/latest",
+    ["rikka"] = "https://static.wikia.nocookie.net/animeadventures/images/c/ce/Chuuni.png/revision/latest",
+    ["rikka_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a8/Chuuni_%28Delusion%29.png/revision/latest",
+    ["rin_oku"] = "https://static.wikia.nocookie.net/animeadventures/images/6/63/Blue_Devil.png/revision/latest",
+    ["roger"] = "https://static.wikia.nocookie.net/animeadventures/images/2/28/Pirate_King.png/revision/latest",
+    ["roger_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/9/9e/Pirate_King_%28Final%29.png/revision/latest",
+    ["rohan"] = "https://static.wikia.nocookie.net/animeadventures/images/5/54/Mangaka.png/revision/latest",
+    ["rohan_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/65/Mangaka_%28Artist%29.png/revision/latest",
+    ["roshi"] = "https://static.wikia.nocookie.net/animeadventures/images/c/cc/Turtle_Master.png/revision/latest",
+    ["rukia_bankai"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b0/Snow_Reaper_%28War%29.png/revision/latest",
+    ["rukia_bankai_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/8/80/Snow_Reaper_%28Final%29.png/revision/latest",
+    ["saber"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a2/Sword_Queen.png/revision/latest",
+    ["saber_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/ca/Sword_Queen_%28Knight%29.png/revision/latest",
+    ["sabo"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e3/Rebel.png/revision/latest",
+    ["sabo_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/8/85/Rebel_%28Flame_Ruler%29.png/revision/latest",
+    ["saiki"] = "https://static.wikia.nocookie.net/animeadventures/images/e/eb/Saickik.png/revision/latest",
+    ["sakamoto"] = "https://static.wikia.nocookie.net/animeadventures/images/2/20/Legendary_Assassin.png/revision/latest",
+    ["sakamoto_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/17/Legendary_Assassin_%28Prime%29.png/revision/latest",
+    ["sasuke"] = "https://static.wikia.nocookie.net/animeadventures/images/f/fd/Sosuke_Deployment_Card.png/revision/latest",
+    ["sasuke_2"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d0/Shinobi_%28Hood%29.png/revision/latest",
+    ["sasuke_2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/15/Shinobi_%28Storm%29.png/revision/latest",
+    ["sasuke_3"] = "https://static.wikia.nocookie.net/animeadventures/images/7/75/Shinobi_%28Awakened%29.png/revision/latest",
+    ["sasuke_3_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/33/Shinobi_%28Eternal%29.png/revision/latest",
+    ["sato"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a2/Demihuman.png/revision/latest",
+    ["sato_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e8/Demihuman_%28Gamer%29.png/revision/latest",
+    ["sayaka"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d0/Saki.png/revision/latest",
+    ["sayaka_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/b/bd/Saki_%28Cyanblade%29.png/revision/latest",
+    ["sengoku_unit"] = "https://static.wikia.nocookie.net/animeadventures/images/9/9a/Golden_Navy.png/revision/latest",
+    ["sengoku_unit_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/9/92/Golden_Navy_%28Buddha%29.png/revision/latest",
+    ["shalltear"] = "https://static.wikia.nocookie.net/animeadventures/images/e/ed/Bloodcry.png/revision/latest",
+    ["shalltear_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3d/Bloodcry_%28Fallen%29.png/revision/latest",
+    ["shanks"] = "https://static.wikia.nocookie.net/animeadventures/images/8/88/Red_Scar.png/revision/latest",
+    ["shanks_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2d/Red_Scar_%28Conqueror%29.png/revision/latest",
+    ["shidou"] = "https://static.wikia.nocookie.net/animeadventures/images/e/ef/Joker.png/revision/latest",
+    ["shigaraki"] = "https://static.wikia.nocookie.net/animeadventures/images/1/11/Ashborn.png/revision/latest",
+    ["shigaraki_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/f/ff/Ashborn_%28Decay%29.png/revision/latest",
+    ["shisui"] = "https://static.wikia.nocookie.net/animeadventures/images/9/9d/Shizo.png/revision/latest",
+    ["shisui_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/33/Shizo_%28Flicker%29.png/revision/latest",
+    ["skull_knight"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a8/Skeleton_Knight.png/revision/latest",
+    ["skull_knight_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/9/91/Skeleton_Knight_%28King%29.png/revision/latest",
+    ["smoker_unit"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d9/Smoka.png/revision/latest",
+    ["smoker_unit_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8d/Smoka_%28Hunter%29.png/revision/latest",
+    ["soifon"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f8/Wasp.png/revision/latest",
+    ["soifon_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c4/Wasp_%28Hornet%29.png/revision/latest",
+    ["sonic"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e0/Supersound.png/revision/latest",
+    ["sonic_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d2/Supersound_%28Speed%29.png/revision/latest",
+    ["speedwagon"] = "https://static.wikia.nocookie.net/animeadventures/images/d/df/C.E.O..png/revision/latest",
+    ["stain"] = "https://static.wikia.nocookie.net/animeadventures/images/2/23/Menace.png/revision/latest",
+    ["stain_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/35/Menace_%28Terror%29.png/revision/latest",
+    ["starlia"] = "https://static.wikia.nocookie.net/animeadventures/images/a/af/Psychic_Princess.png/revision/latest",
+    ["starlia_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/af/Psychic_Princess.png/revision/latest",
+    ["starrk"] = "https://static.wikia.nocookie.net/animeadventures/images/7/70/Jackal.png/revision/latest",
+    ["starrk_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c4/Jackal_%28Alpha%29.png/revision/latest",
+    ["sukuna"] = "https://static.wikia.nocookie.net/animeadventures/images/b/be/Cursed_King.png/revision/latest",
+    ["tanjiro"] = "https://static.wikia.nocookie.net/animeadventures/images/0/05/Tanji_Deployment_Card.png/revision/latest",
+    ["tatara"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1a/Tarata.png/revision/latest",
+    ["tatara_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/38/Tarata_%28Ignite%29.png/revision/latest",
+    ["tatsumaki"] = "https://static.wikia.nocookie.net/animeadventures/images/7/73/Tamiki.png/revision/latest",
+    ["tatsumaki_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/aa/Tamiki_%28Tornado%29.png/revision/latest",
+    ["tatsumi"] = "https://static.wikia.nocookie.net/animeadventures/images/a/aa/Tattermo.png/revision/latest",
+    ["temari"] = "https://static.wikia.nocookie.net/animeadventures/images/8/80/Fan_Ninja.png/revision/latest",
+    ["tengen"] = "https://static.wikia.nocookie.net/animeadventures/images/9/91/Tango.png/revision/latest",
+    ["tengen_2"] = "https://static.wikia.nocookie.net/animeadventures/images/d/dc/Tango_%28Score%29.png/revision/latest",
+    ["tengen_2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/ce/Tango_%28Flash_God%29.png/revision/latest",
+    ["thor"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4c/Lightning_God.png/revision/latest",
+    ["thor_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4c/Lightning_God.png/revision/latest",
+    ["todoroki"] = "https://static.wikia.nocookie.net/animeadventures/images/d/dd/Blaze_Frost.png/revision/latest",
+    ["todoroki_2"] = "https://static.wikia.nocookie.net/animeadventures/images/d/dd/Blaze_Frost.png/revision/latest",
+    ["todoroki_2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/4/40/Blaze_Frost_%28Released%29.png/revision/latest",
+    ["toji"] = "https://static.wikia.nocookie.net/animeadventures/images/8/87/Sorcerer_Killer.png/revision/latest",
+    ["toji_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/17/Sorcerer_Killer_%28Heavenly_Body%29.png/revision/latest",
+    ["toshiro"] = "https://static.wikia.nocookie.net/animeadventures/images/1/16/Icy_Dragon.png/revision/latest",
+    ["toshiro_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/9/91/Icy_Dragon_%28Lotus%29.png/revision/latest",
+    ["trunks_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/d/dd/Unknown.png/revision/latest",
+    ["tsuna"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b5/Takamu.png/revision/latest",
+    ["tsuna_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a0/Takamu_%28Reborn%29.png/revision/latest",
+    ["ulquiorra"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a9/Void_Spear.png/revision/latest",
+    ["ulquiorra_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a9/Void_Spear.png/revision/latest",
+    ["unohana"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b2/Bleed_Queen.png/revision/latest",
+    ["uraraka"] = "https://static.wikia.nocookie.net/animeadventures/images/8/88/Gravity_Hero.png/revision/latest",
+    ["uryu"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a2/Spirit_Archer.png/revision/latest",
+    ["uryu_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/d/dd/Spirit_Archer_%28Reversal%29.png/revision/latest",
+    ["usopp_ts"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1e/Captain_%28Timeskip%29.png/revision/latest",
+    ["usopp_ts_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4a/Captain_%28God%29.png/revision/latest",
+    ["vanilla_ice"] = "https://static.wikia.nocookie.net/animeadventures/images/8/83/Cream.png/revision/latest",
+    ["vanilla_ice_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/10/Cream_%28Void%29.png/revision/latest",
+    ["vash"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c2/Gunslinger.png/revision/latest",
+    ["vash_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/36/Vash_cross.png/revision/latest",
+    ["vegeta_majin"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c6/Vego_%28Mage%29.png/revision/latest",
+    ["vegeta_majin_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/10/Vego_%28Mage_II%29.png/revision/latest",
+    ["vegeta_super"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2a/Vego_%28Super%29.png/revision/latest",
+    ["vegeta_super_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/f/fb/Vego_%28Super_II%29_%28Pose%29.png/revision/latest",
+    ["vegito"] = "https://static.wikia.nocookie.net/animeadventures/images/5/5c/Fused_Hero_%28Pose%29.png/revision/latest",
+    ["wendy"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a1/Wind_Dragon_%28Pose%29.png/revision/latest",
+    ["whitebeard"] = "https://static.wikia.nocookie.net/animeadventures/images/a/ab/Whitehair.png/revision/latest",
+    ["whitebeard_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e7/Emperor_Whitehair.png/revision/latest",
+    ["yamamoto"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f0/Fiery_Commander.png/revision/latest",
+    ["yamamoto_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e9/Fiery_Commander_%28Hellfire%29.png/revision/latest",
+    ["yami"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d8/Black_Blade.png/revision/latest",
+    ["yami_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d8/Black_Blade.png/revision/latest",
+    ["yoshino"] = "https://static.wikia.nocookie.net/animeadventures/images/5/5a/Puppet_Girl.png/revision/latest",
+    ["yoshino_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/06/Puppet_Girl_%28Spirit%29.png/revision/latest",
+    ["yuma"] = "https://static.wikia.nocookie.net/animeadventures/images/9/91/Shrimp.png/revision/latest",
+    ["yuma_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/9/91/Shrimp.png/revision/latest",
+    ["yuno"] = "https://static.wikia.nocookie.net/animeadventures/images/6/6d/Elf_Spirit.png/revision/latest",
+    ["yuno_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/53/Elf_Spirit_%28Wind%29.png/revision/latest",
+    ["yuta"] = "https://static.wikia.nocookie.net/animeadventures/images/5/52/Mimic_Sorcerer.png/revision/latest",
+    ["yuta_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c3/Mimic_Sorcerer_%28Cursed_Child%29.png/revision/latest",
+    ["zabuza"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3b/Mist_Ninja.png/revision/latest",
+    ["zoro"] = "https://static.wikia.nocookie.net/animeadventures/images/d/dd/Zoru_Deployment_Card.png/revision/latest",
+}
+
+-- ============================================================================
+-- MAIN ENTRY POINT
+-- ============================================================================
+local Main = {
+    Config = Config,
+    GameModules = GameModules,
+    UnitImages = UnitImages,
+    WebhookService = WebhookService,
+    JoinStart = JoinStart,
+    DailyService = DailyService,
+    CodeService = CodeService,
+    SummonService = SummonService,
+    FarmService = FarmService,
+    AntiAfkService = AntiAfkService,
+    PerformanceService = PerformanceService,
+    KaitunUIService = KaitunUIService,
+}
+
+function Main:Start()
+    self.KaitunUIService:Create()
+    self.AntiAfkService:Start()
+
+    local ok = self.JoinStart:Run()
+    if not ok then
+        warn("[Main] JoinStart failed")
+        return false
+    end
+
+    self.PerformanceService:Start()
+    self.FarmService:SetupTeleportAutoReload()
+
+    if GameModules.Loader.IsLobby then
+        self.DailyService:ClaimAll()
+        self.CodeService:RedeemAll()
+
+        if self.FarmService:ShouldFarm() then
+            self.FarmService:EnterStoryMatch()
+        else
+            self.SummonService:Run()
+        end
+    else
+        self.FarmService:RunInGame()
+    end
+
+    return true
+end
+
+Main:Start()
+if type(getgenv) == "function" then
+    getgenv().AA_Main = Main
+end
+return Main
