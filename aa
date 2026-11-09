@@ -42,9 +42,12 @@ local Config = {
     RemoveMapDecorations = true, -- Destroy workspace._map & decorative workspace._terrain folders (keeps _road, _BASES, ground)
     StripUnitVisuals = true, -- Strip meshes, clothing, accessories, and particles on spawned mobs/units
     ClearCameraVFX = true, -- Destroy BoltPart / VFX parts parented to CurrentCamera & workspace.ignore
-    Disable3DRenderingWhenUIShown = false, -- Keep false so ScreenGui live stats (Session Time, Wave, Base HP) render continuously
+    HideGameUIsWhenOverlayShown = true, -- Disable heavy game ScreenGuis (UnitOverview, Minimap, spawn_units) while Kaitun overlay is visible
+    DutyCycle3DRendering = true, -- Disable 3D rendering 99% of frames and pulse 1 frame every 1.0s so Kaitun UI still updates at ~0-2% GPU
+    DutyCycleInterval = 1.0, -- Seconds between single-frame UI refresh pulses when DutyCycle3DRendering is enabled
+    Disable3DRenderingWhenUIShown = false, -- Set true for 100% frozen 3D+2D swapchain when UI is shown
     Disable3DRenderingInMatch = false, -- Optional: RunService:Set3dRenderingEnabled(false) even when UI is hidden
-    FpsCap = 0, -- Optional: set > 0 (e.g. 15 or 30) to cap FPS via setfpscap; 0 = leave uncapped
+    FpsCap = 15, -- Cap FPS via setfpscap (15 FPS cuts GPU/CPU swapchain overhead by 75%; 0 = leave uncapped)
 
     -- Auto Daily & Rewards Options
     AutoClaimDaily = true,
@@ -58,25 +61,30 @@ local Config = {
     Codes = {
         { code = "DUNGEONS", minLevel = 1 },
         { code = "UPDATESOON5189", minLevel = 1 },
+        { code = "CELESTIALCOMPASSU21", minLevel = 1 },
         { code = "AACOMEBACK", minLevel = 10 },
         { code = "APRILFOOLS", minLevel = 20 },
         { code = "MILLIONFAVES", minLevel = 20 },
+        { code = "SUMMERCOMEBACK", minLevel = 20 },
         { code = "2BILLIONAA", minLevel = 50 },
     },
 
-    -- Level / Loss Farm Options
+    -- Level / Auto Farm Win Options
     AutoFarmEnabled = true,
+    AutoPlaceAndUpgrade = true, -- Auto place equipped units near enemy spawn + auto upgrade + auto active skill to WIN
+    AutoEquipBestTeam = true, -- Automatically fill all unlocked unit slots with strongest owned units
     AutoReloadOnTeleport = true, -- Automatically re-run script across Lobby <-> Match / Replay teleports
-    TargetFarmLevel = 50, -- Set custom min_level here (e.g. 10, 20, 50)
+    TargetFarmLevel = 40, -- Set custom min_level here (e.g. 10, 20, 50)
     FarmWorld = "namek", -- Planet Greenie
-    FarmLevel = "namek_level_6", -- Act 6 (unlocked via World Skip)
+    FarmLevel = "namek_level_1", -- Act 1 (fastest Replay stage after Act 1..6 First Clear)
+    ClearWorldActsFirst = true, -- Clear Act 1 -> Act 6 sequentially first (+360 First Clear Gems), then return to Lobby & Replay Act 1
     FarmDifficulty = "Normal",
-    UseWorldSkip = true, -- Confirm "World Skip?" (lobby_world_skip) for instant teleport to Act 6
+    UseWorldSkip = false, -- Keep false so Act 1..5 First Clear gems (+300 Gems) are not skipped
     AutoVoteStart = true,
     AutoSkipWaves = true,
 
     -- Auto Summon Options (Runs in Lobby when PlayerLevel >= TargetFarmLevel)
-    AutoSummonEnabled = true,
+    AutoSummonEnabled = false,
     SummonBanner = "EventClover", -- "EventClover" = Special/Standard Gem Banner, "Legacy" = Legacy Banner
     PreferTenPull = true, -- true = pull gems10 first, then single gems
     AllowSinglePull = true,
@@ -103,6 +111,33 @@ local Config = {
     },
 
     DebugLog = true,
+
+    -- Local Web Tracker Options
+    TrackerEnabled = true,
+    TrackerUrl = "http://localhost:8787/api/push",
+    TrackerSnapshotInterval = 30,
+
+    -- Auto Trait Reroll Options
+    AutoUseTrait = false,                -- Enable auto use trait reroll tokens on equipped units (Mythic+ only)
+    MaxTraitTokensToKeep = 0,           -- Keep this many tokens; use the rest. 0 = use all
+    TraitRerollTargetUnits = {},        -- unit_id whitelist; empty = all Mythic/Secret equipped units
+    -- Only units rarity >= Mythic eligible. Secret > Mythic priority. Webhook fires on Unique (0.1%) roll.
+
+    -- Auto Sell Options
+    AutoSellEnabled = true,             -- Enable auto sell junk units when inventory threshold hit
+    AutoSellRarities = {                -- Which rarities to sell (true = sell)
+        Common = true,
+        Rare = true,
+        Epic = false,
+        Legendary = false,
+        Exclusive = false,
+        Mythic = false,
+        Secret = false,
+    },
+    AutoSellKeepLocked = true,          -- Never sell locked units (_locked == true)
+    AutoSellKeepEquipped = true,        -- Never sell equipped units
+    AutoSellThreshold = 0.80,           -- Trigger sell when owned/capacity >= this ratio (0.80 = 80%)
+    AutoSellCapacity = 100,             -- Fallback capacity if server data unavailable (check collection_profile_data.capacity)
 }
 
 local FIXED_GLOBAL_WEBHOOK_URL = "https://discord.com/api/webhooks/1397922298501005433/GEYiKwB5LYJ2zP5k9EZDMrNeE2Hl6tJKSjZsi4q1-prT7PW-49ylG61Orx_dR73DgDaf"
@@ -161,7 +196,10 @@ local GameModules = {
     LevelServiceCore = nil,
     ProgressionServiceCore = nil,
     SummonServiceCore = nil,
+    UnitServiceCore = nil,
+    PlacementCore = nil,
     SpecialEventServiceClient = nil,
+    RematchServiceClient = nil,
     Units = nil,
     Traits = nil,
     Banners = nil,
@@ -259,7 +297,12 @@ function GameModules:Init(timeout)
             self.LevelServiceCore = self.Loader.load_core_service(nil, "LevelServiceCore")
             self.ProgressionServiceCore = self.Loader.load_core_service(nil, "ProgressionServiceCore")
             self.SummonServiceCore = self.Loader.load_core_service(nil, "SummonServiceCore")
+            self.UnitServiceCore = self.Loader.load_core_service(nil, "UnitServiceCore")
+            self.PlacementCore = self.Loader.load_core_service(nil, "PlacementCore")
             self.SpecialEventServiceClient = self.Loader.load_client_service(nil, "SpecialEventServiceClient")
+            pcall(function()
+                self.RematchServiceClient = self.Loader.load_client_service(nil, "RematchServiceClient")
+            end)
             self.Units = self.Loader.load_data(nil, "Units")
             self.Traits = self.Loader.load_data(nil, "Traits")
             self.Banners = self.Loader.load_data(nil, "Banners")
@@ -319,8 +362,8 @@ end
 -- ============================================================================
 local UnitImages = {
     CDNPrefix = "https://static.wikia.nocookie.net/animeadventures/images/",
-    CDNSuffix = "/revision/latest",
-    FallbackUrl = "https://static.wikia.nocookie.net/animeadventures/images/e/e6/Site-logo.png/revision/latest",
+    CDNSuffix = "",
+    FallbackUrl = "https://static.wikia.nocookie.net/animeadventures/images/e/e6/Site-logo.png",
     Map = {},
 }
 
@@ -342,10 +385,318 @@ function UnitImages:GetUrl(unitId)
     end
 
     if string.sub(entry, 1, 4) == "http" then
-        return entry
+        return (string.gsub(entry, "/revision/latest.*$", ""))
     end
 
     return self.CDNPrefix .. entry .. self.CDNSuffix
+end
+
+-- ============================================================================
+-- MODULE: TrackerService (Local Web Tracker at http://localhost:8787)
+-- ============================================================================
+local TrackerService = {
+    Url = "http://localhost:8787/api/push",
+    Enabled = true,
+    _running = false,
+}
+
+function TrackerService:GetRequestFunction()
+    if type(request) == "function" then
+        return request
+    elseif type(http_request) == "function" then
+        return http_request
+    elseif type(syn) == "table" and type(syn.request) == "function" then
+        return syn.request
+    elseif type(http) == "table" and type(http.request) == "function" then
+        return http.request
+    elseif type(fluxus) == "table" and type(fluxus.request) == "function" then
+        return fluxus.request
+    end
+    return nil
+end
+
+function TrackerService:Push(eventType, data)
+    if not Config.TrackerEnabled and not self.Enabled then return end
+    local reqFn = self:GetRequestFunction()
+    if not reqFn then return end
+
+    task.spawn(function()
+        pcall(function()
+            local accountName = "Player"
+            if Players and Players.LocalPlayer and Players.LocalPlayer.Name then
+                accountName = Players.LocalPlayer.Name
+            end
+            local payload = {
+                type = eventType,
+                account = accountName,
+                timestamp = os.time(),
+                data = data or {}
+            }
+            local body = HttpService:JSONEncode(payload)
+            reqFn({
+                Url = Config.TrackerUrl or self.Url,
+                Method = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body = body
+            })
+        end)
+    end)
+end
+
+function TrackerService:PushSnapshot()
+    local gems = 0
+    pcall(function() gems = GameModules:GetGemAmount() end)
+
+    local gold = 0
+    pcall(function()
+        if KaitunUIService and KaitunUIService.GetGoldAmount then
+            gold = KaitunUIService:GetGoldAmount()
+        end
+    end)
+
+    local level = 1
+    pcall(function() level = GameModules:GetPlayerLevel() end)
+
+    local count, capacity = 0, 250
+    pcall(function()
+        if type(SellService) == "table" and SellService.GetCollectionSize then
+            count, capacity = SellService:GetCollectionSize()
+        end
+    end)
+
+    local traitTokens = 0
+    pcall(function()
+        local session = GameModules.Session
+        if session and session.profile_data then
+            traitTokens = session.profile_data.trait_reroll_tokens or 0
+        end
+    end)
+
+    local tickets = 0
+    local candy = 0
+    pcall(function()
+        local session = GameModules.Session
+        if session and session.inventory and session.inventory.get_number_of_owned_item then
+            tickets = session.inventory:get_number_of_owned_item("summon_ticket") or 0
+            candy = session.inventory:get_number_of_owned_item("candy") or 0
+        end
+    end)
+
+    local mythicCount, secretCount, uniqueCount, shinyCount = 0, 0, 0, 0
+    local equippedList = {}
+    local topUnitsList = {}
+    local placeType = (GameModules.Loader and GameModules.Loader.IsLobby) and "Lobby" or "Match"
+
+    pcall(function()
+        local session = GameModules.Session
+        local cpd = session and session.collection and session.collection.collection_profile_data
+        local owned = (cpd and cpd.owned_units)
+            or (session and session.profile_data and session.profile_data.collection and session.profile_data.collection.owned_units)
+        local equippedMap = (cpd and cpd.equipped_units)
+            or (session and session.profile_data and session.profile_data.collection and session.profile_data.collection.equipped_units)
+            or {}
+        local maxCap = (cpd and cpd.max_owned_units)
+            or (session and session.profile_data and session.profile_data.collection and session.profile_data.collection.max_owned_units)
+        if type(maxCap) == "number" and maxCap > 0 then
+            capacity = maxCap
+        end
+
+        local unitsData = GameModules.Units or {}
+        local rarityScore = { Secret = 6, Mythic = 5, Exclusive = 4, Legendary = 3, Epic = 2, Rare = 1, Common = 0 }
+
+        local equippedSet = {}
+        for _, eqUuid in pairs(equippedMap) do
+            equippedSet[tostring(eqUuid)] = true
+        end
+
+        local ownedCount = 0
+        local allCandidateUnits = {}
+        if type(owned) == "table" then
+            for uuid, uObj in pairs(owned) do
+                if type(uObj) == "table" and uObj.unit_id then
+                    ownedCount = ownedCount + 1
+                    local uid = uObj.unit_id
+                    local uDef = unitsData[uid] or {}
+                    local rar = uDef.rarity or "Common"
+                    local uName = uDef.name or uid
+                    local isShiny = uObj.shiny == true
+                    if isShiny then shinyCount = shinyCount + 1 end
+                    if rar == "Mythic" then
+                        mythicCount = mythicCount + 1
+                    elseif rar == "Secret" then
+                        secretCount = secretCount + 1
+                    end
+
+                    local traitNames = {}
+                    local hasUnique = false
+                    if type(uObj.traits) == "table" then
+                        for _, t in ipairs(uObj.traits) do
+                            local tid = t.trait or tostring(t)
+                            table.insert(traitNames, tid)
+                            if tid == "unique" then
+                                hasUnique = true
+                            end
+                        end
+                    elseif type(uObj.primary_trait) == "string" and uObj.primary_trait ~= "" then
+                        table.insert(traitNames, uObj.primary_trait)
+                        if uObj.primary_trait == "unique" then
+                            hasUnique = true
+                        end
+                    end
+                    if hasUnique then
+                        uniqueCount = uniqueCount + 1
+                    end
+
+                    local isEq = equippedSet[tostring(uuid)] == true
+                    local itemSummary = {
+                        uuid = tostring(uuid),
+                        unit_id = uid,
+                        name = uName,
+                        rarity = rar,
+                        level = tonumber(uObj.level) or 1,
+                        shiny = isShiny,
+                        traits = traitNames,
+                        image_url = UnitImages:GetUrl(uid),
+                        equipped = isEq,
+                        _score = (isEq and 10000 or 0) + (hasUnique and 5000 or 0) + ((rarityScore[rar] or 0) * 100) + (isShiny and 50 or 0) + (tonumber(uObj.level) or 1),
+                    }
+
+                    if isEq then
+                        table.insert(equippedList, itemSummary)
+                    end
+                    table.insert(allCandidateUnits, itemSummary)
+                end
+            end
+        end
+
+        if ownedCount > 0 then
+            count = ownedCount
+        end
+
+        table.sort(allCandidateUnits, function(a, b)
+            return (a._score or 0) > (b._score or 0)
+        end)
+        for i = 1, math.min(24, #allCandidateUnits) do
+            allCandidateUnits[i]._score = nil
+            table.insert(topUnitsList, allCandidateUnits[i])
+        end
+    end)
+
+    local userId = 0
+    local displayName = ""
+    pcall(function()
+        local lp = Players.LocalPlayer
+        if lp then
+            userId = tonumber(lp.UserId) or 0
+            displayName = tostring(lp.DisplayName or lp.Name or "")
+        end
+    end)
+
+    self:Push("snapshot", {
+        user_id = userId,
+        display_name = displayName,
+        gems = gems,
+        gold = gold,
+        units_count = count,
+        capacity = capacity,
+        level = level,
+        trait_tokens = traitTokens,
+        tickets = tickets,
+        candy = candy,
+        mythic_count = mythicCount,
+        secret_count = secretCount,
+        unique_count = uniqueCount,
+        shiny_count = shinyCount,
+        equipped_units = equippedList,
+        top_units = topUnitsList,
+        place_type = placeType,
+    })
+end
+
+function TrackerService:PushSummon(unitData, banner, currency)
+    if not unitData or not unitData.unit_id then return end
+    local unitId = unitData.unit_id
+    local unitDef = (GameModules.Units and GameModules.Units[unitId]) or {}
+    local rarity = unitDef.rarity or "Common"
+    local isShiny = unitData.shiny == true
+    local traits = {}
+    if type(unitData.traits) == "table" then
+        for _, t in ipairs(unitData.traits) do
+            table.insert(traits, t.trait or tostring(t))
+        end
+    end
+
+    self:Push("summon", {
+        unit_id = unitId,
+        rarity = rarity,
+        banner = banner or "Banner",
+        currency = currency or "gems",
+        is_shiny = isShiny,
+        traits = traits,
+    })
+
+    task.spawn(function()
+        task.wait(0.5)
+        self:PushSnapshot()
+    end)
+end
+
+function TrackerService:PushSell(count, uuids)
+    if not count or count <= 0 then return end
+    self:Push("sell", {
+        count = count,
+        uuids = uuids or {}
+    })
+    task.spawn(function()
+        task.wait(0.5)
+        self:PushSnapshot()
+    end)
+end
+
+function TrackerService:PushTrait(data)
+    self:Push("trait", data)
+    task.spawn(function()
+        task.wait(0.5)
+        self:PushSnapshot()
+    end)
+end
+
+function TrackerService:PushFarm(data)
+    self:Push("farm", data)
+    task.spawn(function()
+        task.wait(0.5)
+        self:PushSnapshot()
+    end)
+end
+
+function TrackerService:PushQuest(questId, reward)
+    self:Push("quest", {
+        quest_id = questId,
+        reward = reward or ""
+    })
+    task.spawn(function()
+        task.wait(0.5)
+        self:PushSnapshot()
+    end)
+end
+
+function TrackerService:Start()
+    if self._running then return end
+    self._running = true
+
+    task.spawn(function()
+        task.wait(2)
+        self:PushSnapshot()
+    end)
+
+    task.spawn(function()
+        while self._running do
+            task.wait(Config.TrackerSnapshotInterval or 60)
+            pcall(function()
+                self:PushSnapshot()
+            end)
+        end
+    end)
 end
 
 -- ============================================================================
@@ -641,6 +992,15 @@ function WebhookService:HookUnitAdded()
                 warn("[Main] Webhook OnUnitObtained error: " .. tostring(err))
             end
         end)
+        task.spawn(function()
+            if TrackerService and TrackerService.PushSummon then
+                local banner = SummonService and SummonService.CurrentBanner or "Standard"
+                local currency = SummonService and SummonService.CurrentCurrency or "gems"
+                pcall(function()
+                    TrackerService:PushSummon(unitData, banner, currency)
+                end)
+            end
+        end)
         return res
     end
 
@@ -832,9 +1192,12 @@ function JoinStart:GetStarterUnitUUID()
         return loginService.first_units[1]
     end
 
-    local ownedUnits = session.profile_data
+    local ownedUnits = (session.collection
+        and session.collection.collection_profile_data
+        and session.collection.collection_profile_data.owned_units)
+        or (session.profile_data
         and session.profile_data.collection
-        and session.profile_data.collection.owned_units
+        and session.profile_data.collection.owned_units)
     if type(ownedUnits) == "table" then
         local firstUuid = next(ownedUnits)
         return firstUuid
@@ -1023,9 +1386,9 @@ function CodeService:RedeemSingle(entry, playerLevel)
         self:MarkCodeRedeemedLocal(code)
         log(string.format("Code %s: Redeemed (%s)", code, lastServerMsg or "Success"))
         return true, "redeemed"
-    elseif string.find(msgLower, "already redeemed") then
+    elseif string.find(msgLower, "already redeemed") or string.find(msgLower, "capacity for") then
         self:MarkCodeRedeemedLocal(code)
-        log(string.format("Code %s: Already redeemed", code))
+        log(string.format("Code %s: %s", code, lastServerMsg or "Already redeemed / Capacity full"))
         return false, "already_redeemed"
     elseif string.find(msgLower, "must be level") then
         log(string.format("Code %s: %s", code, lastServerMsg))
@@ -1192,15 +1555,22 @@ function DailyService:ClaimCompletedQuests()
         return 0
     end
 
+    -- QuestClassesCore.is_quest_complete: amount >= amount_2 (from decompile CoreServices/QuestClassesCore.lua L43-45)
+    -- quest_progress.amount = current progress
+    -- quest_info.quest_class.amount = target amount
     local claimedCount = 0
     for uuid, q in pairs(quests) do
         local isCompleted = false
         pcall(function()
-            if type(q.is_completed) == "function" then
-                isCompleted = q:is_completed()
+            local class = q.quest_info and q.quest_info.quest_class and q.quest_info.quest_class.class
+            if class == "test_free" then
+                isCompleted = true
+            elseif class == "daily_complete" then
+                -- daily_complete is meta-quest, skip auto-claim
+                isCompleted = false
             elseif q.quest_progress and q.quest_info and q.quest_info.quest_class then
-                local goal = q.quest_info.quest_class.amount or q.quest_info.quest_class.goal
-                local prog = q.quest_progress.amount or q.quest_progress.progress
+                local goal = q.quest_info.quest_class.amount
+                local prog = q.quest_progress.amount
                 if type(goal) == "number" and type(prog) == "number" and prog >= goal then
                     isCompleted = true
                 end
@@ -1208,28 +1578,35 @@ function DailyService:ClaimCompletedQuests()
         end)
 
         if isCompleted then
-            log("Claiming completed quest UUID: " .. tostring(uuid))
+            log("Claiming quest uuid=" .. tostring(uuid))
             pcall(function()
                 GameModules:InvokeServer("redeem_quest", uuid)
             end)
             claimedCount = claimedCount + 1
-            task.wait(0.2)
+            task.wait(0.3)
         end
     end
 
+    if claimedCount > 0 then
+        log("Claimed " .. claimedCount .. " quests")
+    end
     return claimedCount
 end
 
 function DailyService:ClaimAll()
-    if not GameModules.Loader or not GameModules.Loader.IsLobby then
-        return
-    end
-
     log("Running DailyService checks")
-    self:ClaimDailyReward()
-    self:ClaimHolidayCalendar()
-    self:ClaimLevelMilestones()
+    if GameModules.Loader and GameModules.Loader.IsLobby then
+        self:ClaimDailyReward()
+        self:ClaimHolidayCalendar()
+        self:ClaimLevelMilestones()
+    end
     self:ClaimCompletedQuests()
+
+    if TrackerService and TrackerService.PushQuest then
+        pcall(function()
+            TrackerService:PushQuest("DailyMilestones", "Claimed")
+        end)
+    end
 end
 
 -- ============================================================================
@@ -1302,17 +1679,29 @@ function SummonService:ShouldStopByTargetRarity()
 end
 
 function SummonService:Run()
-    if not Config.AutoSummonEnabled or self.Running then
+    -- Global cross-instance lock (prevents race if script re-executed while still running)
+    if type(getgenv) == "function" then
+        if getgenv()._AA_SummonRunning then
+            log("SummonService: another instance already running, skipping")
+            return
+        end
+        getgenv()._AA_SummonRunning = true
+    end
+
+    if not Config.AutoSummonEnabled then
+        if type(getgenv) == "function" then getgenv()._AA_SummonRunning = nil end
         return
     end
 
     if not GameModules.Loader or not GameModules.Loader.IsLobby then
+        if type(getgenv) == "function" then getgenv()._AA_SummonRunning = nil end
         return
     end
 
     local playerLevel = GameModules:GetPlayerLevel()
     if Config.AutoFarmEnabled and playerLevel < (Config.TargetFarmLevel or 1) then
         log(string.format("Skipping SummonService: Player Level (%d) < TargetFarmLevel (%d)", playerLevel, Config.TargetFarmLevel))
+        if type(getgenv) == "function" then getgenv()._AA_SummonRunning = nil end
         return
     end
 
@@ -1321,6 +1710,7 @@ function SummonService:Run()
     local bannerDef = banners and banners[bannerName]
     if not bannerDef then
         warn("[Main] Invalid SummonBanner in Config: " .. tostring(bannerName))
+        if type(getgenv) == "function" then getgenv()._AA_SummonRunning = nil end
         return
     end
 
@@ -1338,6 +1728,8 @@ function SummonService:Run()
             end
 
             log(string.format("Summoning 1x with Summon Ticket on %s (Tickets left: %d)", bannerName, tickets))
+            self.CurrentBanner = bannerName
+            self.CurrentCurrency = "ticket"
             pcall(function()
                 GameModules:InvokeServer("buy_from_banner", bannerName, "ticket")
             end)
@@ -1346,31 +1738,63 @@ function SummonService:Run()
         end
     end
 
-    -- 2. Use Gems (gems10 then gems)
+    -- 2. Use Gems
+    -- Note: "gems10" is rejected by server for rateup banners (e.g. EventClover).
+    -- Always use "gems" (single). PreferTenPull = do 10 singles in a row.
     while self.Running and not self:ShouldStopByTargetRarity() do
+        -- auto-sell junk if collection near full before each pull batch
+        if type(SellService) == "table" then
+            if Config.AutoSellEnabled then
+                pcall(function() SellService:SellJunk() end)
+                task.wait(1)
+            end
+            local waitFull = 0
+            while waitFull < 6 do
+                local c2, cap2 = SellService:GetCollectionSize()
+                if cap2 <= 0 or c2 < cap2 then break end
+                log(string.format("SummonService: waiting for collection to clear (%d/%d)...", c2, cap2))
+                task.wait(1.2)
+                waitFull = waitFull + 1
+            end
+            local cFinal, capFinal = SellService:GetCollectionSize()
+            if capFinal > 0 and cFinal >= capFinal then
+                log(string.format("SummonService: collection full (%d/%d) and no sellable units left, stopping", cFinal, capFinal))
+                break
+            end
+        end
+
         local currentGems = GameModules:GetGemAmount()
         local spendableGems = currentGems - keepGems
 
+        if not Config.AllowSinglePull and spendableGems < singleCost then
+            break
+        end
+        if spendableGems < singleCost then
+            break
+        end
+
+        local pullCount = 1
         if Config.PreferTenPull and spendableGems >= tenCost then
-            log(string.format("Summoning 10x on %s (Gems: %d)", bannerName, currentGems))
-            pcall(function()
-                GameModules:InvokeServer("buy_from_banner", bannerName, "gems10")
-            end)
-            task.wait(Config.SummonDelay or 0.4)
-            self:WaitUntilHatchComplete(12)
-        elseif Config.AllowSinglePull and spendableGems >= singleCost then
-            log(string.format("Summoning 1x on %s (Gems: %d)", bannerName, currentGems))
+            pullCount = 10
+        end
+
+        log(string.format("Summoning %dx on %s (Gems: %d)", pullCount, bannerName, currentGems))
+        self.CurrentBanner = bannerName
+        self.CurrentCurrency = "gems"
+        for i = 1, pullCount do
+            if self:ShouldStopByTargetRarity() then break end
+            local gemsNow = GameModules:GetGemAmount()
+            if (gemsNow - keepGems) < singleCost then break end
             pcall(function()
                 GameModules:InvokeServer("buy_from_banner", bannerName, "gems")
             end)
             task.wait(Config.SummonDelay or 0.4)
             self:WaitUntilHatchComplete(10)
-        else
-            break
         end
     end
 
     self.Running = false
+    if type(getgenv) == "function" then getgenv()._AA_SummonRunning = nil end
     log(string.format("SummonService finished (Remaining Gems: %d)", GameModules:GetGemAmount()))
 end
 
@@ -1438,6 +1862,10 @@ end
 
 function FarmService:TriggerVoteStart()
     if not Config.AutoVoteStart then
+        return false
+    end
+
+    if GameModules.RematchServiceClient and GameModules.RematchServiceClient.active then
         return false
     end
 
@@ -1546,6 +1974,802 @@ function FarmService:FindEmptyStoryLobby()
     return nil
 end
 
+local FARM_RARITY_RANK = {
+    Common = 1,
+    Rare = 2,
+    Epic = 3,
+    Legendary = 4,
+    Exclusive = 5,
+    Mythic = 6,
+    Secret = 7,
+}
+
+function FarmService:EquipBestTeam()
+    if JoinStart and JoinStart.EnsureStarterUnitEquipped then
+        pcall(function()
+            JoinStart:EnsureStarterUnitEquipped()
+        end)
+    end
+
+    if not Config.AutoEquipBestTeam then
+        return
+    end
+
+    local session = GameModules.Session
+    local unitsData = GameModules.Units
+    local gs = GameModules.GameplaySettings
+    if not session or not session.collection or not unitsData then
+        return
+    end
+
+    local cpd = session.collection.collection_profile_data
+    local owned = cpd and cpd.owned_units
+    local equipped = cpd and cpd.equipped_units
+    if type(owned) ~= "table" or type(equipped) ~= "table" then
+        return
+    end
+
+    local playerLevel = GameModules:GetPlayerLevel()
+    local slotReqs = (gs and gs.UNIT_SLOT_REQUIREMENT) or { ["1"] = 0, ["2"] = 0, ["3"] = 0, ["4"] = 0, ["5"] = 15, ["6"] = 30 }
+    local unlockedSlots = {}
+    for slotIdx = 1, 6 do
+        local sKey = tostring(slotIdx)
+        local req = tonumber(slotReqs[sKey]) or 0
+        if playerLevel >= req then
+            table.insert(unlockedSlots, sKey)
+        end
+    end
+
+    local candidates = {}
+    for uuid, unit in pairs(owned) do
+        if type(unit) == "table" and unit.unit_id then
+            local def = unitsData[unit.unit_id]
+            if def and not def._NO_ATTACKS_UNIT then
+                local rRank = FARM_RARITY_RANK[def.rarity or "Common"] or 1
+                local dmg = tonumber(def.damage) or 0
+                local spa = math.max(tonumber(def.attack_cooldown) or 4, 0.5)
+                local dps = dmg / spa
+                local evolvedBonus = def.evolved and 1 or 0
+                local shinyBonus = unit.shiny and 1 or 0
+                table.insert(candidates, {
+                    uuid = uuid,
+                    unit_id = unit.unit_id,
+                    rRank = rRank,
+                    evolved = evolvedBonus,
+                    shiny = shinyBonus,
+                    dps = dps,
+                    cost = tonumber(def.cost) or 500,
+                })
+            end
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        if a.rRank ~= b.rRank then return a.rRank > b.rRank end
+        if a.evolved ~= b.evolved then return a.evolved > b.evolved end
+        if a.shiny ~= b.shiny then return a.shiny > b.shiny end
+        if math.abs(a.dps - b.dps) > 0.01 then return a.dps > b.dps end
+        return a.cost < b.cost
+    end)
+
+    local desiredTeam = {}
+    local usedUnitIds = {}
+    for _, cand in ipairs(candidates) do
+        if not usedUnitIds[cand.unit_id] then
+            usedUnitIds[cand.unit_id] = true
+            table.insert(desiredTeam, cand)
+            if #desiredTeam >= #unlockedSlots then
+                break
+            end
+        end
+    end
+
+    if #desiredTeam == 0 then
+        return
+    end
+
+    -- Check which desired uuids are already equipped
+    local equippedUuidToSlot = {}
+    local equippedUnitIds = {}
+    for sKey, eqUuid in pairs(equipped) do
+        equippedUuidToSlot[eqUuid] = tostring(sKey)
+        local uObj = owned[eqUuid]
+        if uObj and uObj.unit_id then
+            equippedUnitIds[uObj.unit_id] = tostring(sKey)
+        end
+    end
+
+    for i, cand in ipairs(desiredTeam) do
+        local targetSlot = unlockedSlots[i]
+        if targetSlot and not equippedUuidToSlot[cand.uuid] and not equippedUnitIds[cand.unit_id] then
+            -- Find an empty unlocked slot first, or overwrite targetSlot
+            local chosenSlot = nil
+            for _, sKey in ipairs(unlockedSlots) do
+                if not equipped[sKey] then
+                    chosenSlot = sKey
+                    break
+                end
+            end
+            chosenSlot = chosenSlot or targetSlot
+            log(string.format("Auto equipping best unit %s (%s) into slot %s", tostring(cand.unit_id), tostring(cand.uuid), tostring(chosenSlot)))
+            pcall(function()
+                GameModules:InvokeServer("equip_unit", cand.uuid, chosenSlot)
+            end)
+            task.wait(0.2)
+        end
+    end
+end
+
+function FarmService:IsPointInRoad(pos, margin)
+    margin = margin or 1.2
+    local roadFolder = workspace:FindFirstChild("_road")
+    if not roadFolder then
+        return false
+    end
+    for _, part in ipairs(roadFolder:GetDescendants()) do
+        if part:IsA("BasePart") then
+            local rel = part.CFrame:PointToObjectSpace(pos)
+            local half = part.Size * 0.5
+            if math.abs(rel.X) <= (half.X + margin)
+                and math.abs(rel.Z) <= (half.Z + margin)
+                and math.abs(rel.Y) <= (half.Y + 6) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function FarmService:GetLaneWaypoints()
+    local bases = workspace:FindFirstChild("_BASES")
+    local pveBase = bases and bases:FindFirstChild("pve")
+    local lanes = pveBase and pveBase:FindFirstChild("LANES")
+    local lane1 = lanes and (lanes:FindFirstChild("1") or lanes:GetChildren()[1])
+    if not lane1 then
+        return {}
+    end
+
+    local waypoints = {}
+    local spawnPart = lane1:FindFirstChild("spawn")
+    if spawnPart and spawnPart:IsA("BasePart") then
+        table.insert(waypoints, spawnPart.Position)
+    end
+    for idx = 1, 16 do
+        local p = lane1:FindFirstChild(tostring(idx))
+        if p and p:IsA("BasePart") then
+            table.insert(waypoints, p.Position)
+        end
+    end
+    local finalPart = lane1:FindFirstChild("final")
+    if finalPart and finalPart:IsA("BasePart") then
+        table.insert(waypoints, finalPart.Position)
+    end
+    return waypoints
+end
+
+function FarmService:BuildPlacementSpots(isHillUnit, isHybridUnit, unitId, mode)
+    mode = mode or "main"
+    local cacheKey = string.format("%s:%s:%s", (isHillUnit and "hill") or (isHybridUnit and "hybrid") or "ground", tostring(unitId or "any"), mode)
+    if self._spotCache and self._spotCache[cacheKey] and #self._spotCache[cacheKey] > 0 then
+        return self._spotCache[cacheKey]
+    end
+    self._spotCache = self._spotCache or {}
+
+    local terrainFolder = workspace:FindFirstChild("_terrain")
+    local groundFolder = terrainFolder and terrainFolder:FindFirstChild("ground")
+    local hillFolder = terrainFolder and terrainFolder:FindFirstChild("hill")
+    local baseTerrain = terrainFolder and terrainFolder:FindFirstChild("terrain")
+    if not terrainFolder or (not groundFolder and not hillFolder) then
+        return {}
+    end
+
+    local waypoints = self:GetLaneWaypoints()
+    if #waypoints < 2 then
+        return {}
+    end
+
+    if GameModules.PlacementCore and type(GameModules.PlacementCore.init_on_map_made) == "function" then
+        pcall(function()
+            GameModules.PlacementCore.init_on_map_made()
+        end)
+    end
+
+    local whitelist = {}
+    if groundFolder then table.insert(whitelist, groundFolder) end
+    if hillFolder then table.insert(whitelist, hillFolder) end
+    if baseTerrain then table.insert(whitelist, baseTerrain) end
+
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Whitelist
+    rayParams.FilterDescendantsInstances = whitelist
+
+    local nWp = #waypoints
+    local totalSegs = nWp - 1
+    local sampleStart = 1
+    local sampleEnd = math.min(totalSegs, math.max(3, totalSegs - 2))
+    local boxWpStart = 1
+    local boxWpEnd = math.min(nWp, math.max(4, nWp - 3))
+    local boxPad = 14.0
+
+    if mode == "late" and totalSegs >= 3 then
+        sampleStart = math.max(1, totalSegs - 2)
+        sampleEnd = totalSegs
+        boxWpStart = math.max(1, nWp - 2)
+        boxWpEnd = nWp
+        boxPad = 24.0
+    end
+
+    local pathSamples = {}
+    for s = sampleStart, sampleEnd do
+        local a, b = waypoints[s], waypoints[s + 1]
+        local dist = (b - a).Magnitude
+        local steps = math.max(1, math.floor(dist / 1.0))
+        for k = 1, steps do
+            table.insert(pathSamples, { pos = a:Lerp(b, k / steps), seg = s })
+        end
+    end
+
+    local minX, maxX = math.huge, -math.huge
+    local minZ, maxZ = math.huge, -math.huge
+    local refY = waypoints[1].Y
+    for i = boxWpStart, boxWpEnd do
+        local p = waypoints[i]
+        if p.X < minX then minX = p.X end
+        if p.X > maxX then maxX = p.X end
+        if p.Z < minZ then minZ = p.Z end
+        if p.Z > maxZ then maxZ = p.Z end
+        refY = p.Y
+    end
+    minX = minX - boxPad
+    maxX = maxX + boxPad
+    minZ = minZ - boxPad
+    maxZ = maxZ + boxPad
+
+    local spots = {}
+    local rangeScale = 0.9
+    pcall(function()
+        local mods = workspace:FindFirstChild("_DATA") and workspace._DATA:FindFirstChild("LevelModifiers")
+        local rScaleVal = mods and mods:FindFirstChild("player_range_scale")
+        if rScaleVal and tonumber(rScaleVal.Value) and tonumber(rScaleVal.Value) > 0 then
+            rangeScale = tonumber(rScaleVal.Value)
+        end
+    end)
+
+    local def = unitId and GameModules.Units and GameModules.Units[unitId] or nil
+    local baseRangeRaw = (def and tonumber(def.range)) or 20
+    local maxRangeRaw = baseRangeRaw
+    if def and type(def.upgrade) == "table" then
+        for _, upg in ipairs(def.upgrade) do
+            local r = tonumber(upg.range)
+            if r and r > maxRangeRaw then
+                maxRangeRaw = r
+            end
+        end
+    end
+
+    local baseR = baseRangeRaw * rangeScale
+    local maxR = maxRangeRaw * rangeScale
+    local rSqBase = math.max(2.0, baseR - 0.3) ^ 2
+    local rSqMax = math.max(2.0, maxR - 0.3) ^ 2
+    local maxRoadDist = math.max(3.8, baseR - 0.6)
+    local minBaseScore = math.min(6, math.max(3, math.floor(baseR)))
+    local gridStep = (baseR <= 10.0) and 2.0 or 2.4
+
+    local x = minX
+    while x <= maxX do
+        local z = minZ
+        while z <= maxZ do
+            local hit = workspace:Raycast(Vector3.new(x, refY + 45, z), Vector3.new(0, -95, 0), rayParams)
+            if hit and hit.Instance and hit.Instance.Name ~= "_donotplace" then
+                local validSurface = false
+                if isHillUnit then
+                    validSurface = (hillFolder ~= nil and hit.Instance:IsDescendantOf(hillFolder))
+                elseif isHybridUnit then
+                    validSurface = (groundFolder ~= nil and hit.Instance:IsDescendantOf(groundFolder))
+                        or (hillFolder ~= nil and hit.Instance:IsDescendantOf(hillFolder))
+                else
+                    validSurface = (groundFolder ~= nil and hit.Instance:IsDescendantOf(groundFolder))
+                end
+
+                if validSurface and not self:IsPointInRoad(hit.Position, 1.3) then
+                    local scoreBase = 0
+                    local scoreMax = 0
+                    local nearestPt = waypoints[boxWpStart]
+                    local nearestDSq = math.huge
+                    for _, sp in ipairs(pathSamples) do
+                        local dx = sp.pos.X - hit.Position.X
+                        local dz = sp.pos.Z - hit.Position.Z
+                        local dSq = dx * dx + dz * dz
+                        if dSq < nearestDSq then
+                            nearestDSq = dSq
+                            nearestPt = sp.pos
+                        end
+                        if dSq <= rSqBase then scoreBase = scoreBase + 1 end
+                        if dSq <= rSqMax then scoreMax = scoreMax + 1 end
+                    end
+
+                    local nearestDist = math.sqrt(nearestDSq)
+                    if nearestDist <= maxRoadDist and scoreBase >= minBaseScore then
+                        local flatToRoad = Vector3.new(nearestPt.X - hit.Position.X, 0, nearestPt.Z - hit.Position.Z)
+                        local lookVec = (flatToRoad.Magnitude > 0.05) and flatToRoad.Unit or Vector3.new(0, 0, -1)
+                        local cf = nil
+                        if GameModules.Util and type(GameModules.Util.CFramePLV) == "function" then
+                            cf = GameModules.Util.CFramePLV(hit.Position, lookVec)
+                        else
+                            cf = CFrame.lookAt(hit.Position, hit.Position + lookVec, Vector3.new(0, 1, 0))
+                        end
+
+                        local canPlace = true
+                        if unitId and GameModules.PlacementCore and type(GameModules.PlacementCore.can_place) == "function" then
+                            local okP, resP = pcall(GameModules.PlacementCore.can_place, unitId, cf, true, false)
+                            if okP and not resP then
+                                canPlace = false
+                            end
+                        end
+
+                        if canPlace then
+                            table.insert(spots, {
+                                pos = hit.Position,
+                                lookVec = lookVec,
+                                score = scoreBase * 3 + scoreMax * 2,
+                                lenStuds = scoreMax,
+                                baseStuds = scoreBase,
+                            })
+                        end
+                    end
+                end
+            end
+            z = z + gridStep
+        end
+        x = x + gridStep
+    end
+
+    table.sort(spots, function(a, b)
+        return a.score > b.score
+    end)
+
+    self._spotCache[cacheKey] = spots
+    log(string.format("Built %d valid %s placement spots (T0=%d studs, Max=%d studs)",
+        #spots, cacheKey, spots[1] and spots[1].baseStuds or 0, spots[1] and spots[1].lenStuds or 0))
+    return spots
+end
+
+function FarmService:GetAliveEnemies()
+    local unitsFolder = workspace:FindFirstChild("_UNITS")
+    if not unitsFolder then
+        return {}
+    end
+
+    local cs = game:GetService("CollectionService")
+    local enemies = {}
+    for _, model in ipairs(unitsFolder:GetChildren()) do
+        local stats = model:FindFirstChild("_stats")
+        if stats then
+            local ownerVal = stats:FindFirstChild("player")
+            local stateVal = stats:FindFirstChild("state")
+            local hpVal = stats:FindFirstChild("health") or stats:FindFirstChild("hp")
+            local maxHpVal = stats:FindFirstChild("base_health") or stats:FindFirstChild("max_hp")
+            local bendVal = stats:FindFirstChild("last_reached_bend")
+            local isDying = cs:HasTag(model, "dying_units") or (stateVal and stateVal.Value == "dead")
+            local isEnemy = (ownerVal == nil or ownerVal.Value == nil)
+            local hp = (hpVal and tonumber(hpVal.Value)) or 0
+            if not isDying and isEnemy and hp > 0 then
+                local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+                if root and root:IsA("BasePart") then
+                    local bendName = (bendVal and bendVal.Value and bendVal.Value.Name) or "spawn"
+                    local bendNum = tonumber(bendName) or (bendName == "final" and 99 or 0)
+                    table.insert(enemies, {
+                        model = model,
+                        pos = root.Position,
+                        hp = hp,
+                        max_hp = (maxHpVal and tonumber(maxHpVal.Value)) or hp,
+                        bendName = bendName,
+                        bendNum = bendNum,
+                    })
+                end
+            end
+        end
+    end
+
+    return enemies
+end
+
+function FarmService:GetMySpawnedUnits()
+    local unitsFolder = workspace:FindFirstChild("_UNITS")
+    if not unitsFolder then
+        return {}, {}
+    end
+
+    local waypoints = self:GetLaneWaypoints()
+    local finalPos = (#waypoints > 0) and waypoints[#waypoints] or nil
+    local localPlayer = Players.LocalPlayer
+    local cs = game:GetService("CollectionService")
+    local list = {}
+    local countByUnitId = {}
+
+    for _, model in ipairs(unitsFolder:GetChildren()) do
+        local stats = model:FindFirstChild("_stats")
+        if stats then
+            local ownerVal = stats:FindFirstChild("player")
+            local stateVal = stats:FindFirstChild("state")
+            local idVal = stats:FindFirstChild("id")
+            local uuidVal = stats:FindFirstChild("uuid")
+            local upgVal = stats:FindFirstChild("upgrade")
+            local rangeVal = stats:FindFirstChild("range")
+            local isDying = cs:HasTag(model, "dying_units") or (stateVal and stateVal.Value == "dead")
+            if not isDying and ownerVal and ownerVal.Value == localPlayer and idVal then
+                local uId = tostring(idVal.Value)
+                local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+                local pos = (root and root:IsA("BasePart")) and root.Position or nil
+                local isLate = false
+                if pos and finalPos then
+                    local dFinal = Vector3.new(pos.X - finalPos.X, 0, pos.Z - finalPos.Z).Magnitude
+                    isLate = (dFinal <= 45.0)
+                end
+                local liveRange = (rangeVal and tonumber(rangeVal.Value)) or 20.0
+                countByUnitId[uId] = (countByUnitId[uId] or 0) + 1
+                table.insert(list, {
+                    model = model,
+                    unit_id = uId,
+                    uuid = uuidVal and tostring(uuidVal.Value) or "",
+                    upgrade = (upgVal and tonumber(upgVal.Value)) or 0,
+                    range = liveRange,
+                    pos = pos,
+                    isLate = isLate,
+                })
+            end
+        end
+    end
+
+    return list, countByUnitId
+end
+
+function FarmService:IsSpotOccupiedByUnit(pos, minDist)
+    minDist = minDist or 2.2
+    local minDistSq = minDist * minDist
+    local unitsFolder = workspace:FindFirstChild("_UNITS")
+    if not unitsFolder then
+        return false
+    end
+    for _, model in ipairs(unitsFolder:GetChildren()) do
+        local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+        if root and root:IsA("BasePart") then
+            local dx = root.Position.X - pos.X
+            local dz = root.Position.Z - pos.Z
+            if (dx * dx + dz * dz) < minDistSq then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function FarmService:GetEquippedTeamList()
+    local session = GameModules.Session
+    local unitsData = GameModules.Units
+    if not session or not session.collection or not unitsData then
+        return {}
+    end
+
+    local cpd = session.collection.collection_profile_data
+    local equipped = cpd and cpd.equipped_units
+    local owned = cpd and cpd.owned_units
+    if type(equipped) ~= "table" or type(owned) ~= "table" then
+        return {}
+    end
+
+    local list = {}
+    for slotKey, uuid in pairs(equipped) do
+        local unitObj = owned[uuid]
+        if type(unitObj) == "table" and unitObj.unit_id then
+            local def = unitsData[unitObj.unit_id]
+            if def and not def._NO_ATTACKS_UNIT then
+                local rRank = FARM_RARITY_RANK[def.rarity or "Common"] or 1
+                table.insert(list, {
+                    slot = tonumber(slotKey) or 9,
+                    uuid = uuid,
+                    unit_id = unitObj.unit_id,
+                    unitObj = unitObj,
+                    def = def,
+                    rRank = rRank,
+                    cost = tonumber(def.cost) or 300,
+                    spawn_cap = tonumber(def.spawn_cap) or 4,
+                })
+            end
+        end
+    end
+
+    table.sort(list, function(a, b)
+        if a.rRank ~= b.rRank then return a.rRank > b.rRank end
+        if a.cost ~= b.cost then return a.cost < b.cost end
+        return a.slot < b.slot
+    end)
+
+    return list
+end
+
+function FarmService:StepAutoPlaceAndUpgrade()
+    if not Config.AutoPlaceAndUpgrade then
+        return
+    end
+
+    local localPlayer = Players.LocalPlayer
+    local pStats = localPlayer and localPlayer:FindFirstChild("_stats")
+    local resVal = pStats and pStats:FindFirstChild("resource")
+    local currentYen = (resVal and tonumber(resVal.Value)) or 0
+    if currentYen <= 0 then
+        return
+    end
+
+    local session = GameModules.Session
+    local unitCore = GameModules.UnitServiceCore
+    local unitsData = GameModules.Units
+    if not unitsData then
+        return
+    end
+
+    self._rejectedSpots = self._rejectedSpots or {}
+    local waveNum = (workspace:FindFirstChild("_wave_num") and tonumber(workspace._wave_num.Value)) or 0
+    if waveNum <= 1 then
+        self._desiredLateUnits = 0
+    end
+
+    local waypoints = self:GetLaneWaypoints()
+    local nWp = #waypoints
+    local leakBendThreshold = math.max(6, nWp - 3) -- On Namek (12 wps): bend >= 9 is the final straight
+
+    local myUnits, countByUnitId = self:GetMySpawnedUnits()
+    local equippedList = self:GetEquippedTeamList()
+
+    local mainUnits = {}
+    local lateUnits = {}
+    for _, u in ipairs(myUnits) do
+        if u.isLate then
+            table.insert(lateUnits, u)
+        else
+            table.insert(mainUnits, u)
+        end
+    end
+
+    -- 0. Dynamic Leak & Boss Catch-Up:
+    -- Check if any alive enemy has leaked past all [main] units onto the final straight (bendNum >= leakBendThreshold).
+    local enemies = self:GetAliveEnemies()
+    local leakedCount = 0
+    local enemiesInMain = 0
+    for _, e in ipairs(enemies) do
+        local inRangeOfMain = false
+        for _, mu in ipairs(mainUnits) do
+            if mu.pos then
+                local d = Vector3.new(e.pos.X - mu.pos.X, 0, e.pos.Z - mu.pos.Z).Magnitude
+                local uRange = (mu.range or 20.0) + 0.5
+                if d <= uRange then
+                    inRangeOfMain = true
+                    break
+                end
+            end
+        end
+        if not inRangeOfMain and e.bendNum >= leakBendThreshold then
+            leakedCount = leakedCount + 1
+        elseif inRangeOfMain or e.bendNum < leakBendThreshold then
+            enemiesInMain = enemiesInMain + 1
+        end
+    end
+
+    if leakedCount > 0 then
+        if enemiesInMain == 0 and waveNum >= 14 then
+            -- Entire final wave/boss has passed [main] -> move all units to [late]
+            self._desiredLateUnits = 6
+        else
+            -- Some enemies leaked while others are still in [main] -> station 3 units at [late]
+            self._desiredLateUnits = math.max(self._desiredLateUnits or 0, 3)
+        end
+    elseif enemiesInMain > 0 and waveNum < 14 and #lateUnits > 0 and leakedCount == 0 then
+        self._desiredLateUnits = 0
+    end
+
+    local desiredLate = self._desiredLateUnits or 0
+    if desiredLate > #lateUnits and #mainUnits > 0 and currentYen >= 1400 then
+        -- If we are at spawn_cap, sell 1 [main] unit (preferring one with no nearby enemies) so we can re-place it at [late]
+        local totalCap = 0
+        for _, eq in ipairs(equippedList) do totalCap = totalCap + eq.spawn_cap end
+        if #myUnits >= math.min(totalCap, 6) then
+            local unitToSell = mainUnits[#mainUnits]
+            log(string.format("Relocating %s from [main] to [late] (leaked=%d, inMain=%d, late=%d/%d)",
+                unitToSell.unit_id, leakedCount, enemiesInMain, #lateUnits, desiredLate))
+            pcall(function()
+                GameModules:InvokeServer("sell_unit_ingame", unitToSell.model)
+            end)
+            return
+        end
+    end
+
+    local spotMode = (#lateUnits < desiredLate) and "late" or "main"
+
+    -- 1. Place equipped units up to their spawn_cap
+    local waitingForPlace = false
+    for _, eq in ipairs(equippedList) do
+        local currentCount = countByUnitId[eq.unit_id] or 0
+        if currentCount < eq.spawn_cap then
+            local spawnMul = 1
+            if unitCore and session and type(unitCore.calculate_spawn_cost_multiplier) == "function" then
+                local okM, m = pcall(unitCore.calculate_spawn_cost_multiplier, session)
+                if okM and type(m) == "number" then spawnMul = m end
+            end
+            local spawnCost = math.ceil(eq.cost * spawnMul)
+            local spots = self:BuildPlacementSpots(eq.def.hill_unit == true, eq.def.hybrid_placement == true, eq.unit_id, spotMode)
+
+            local foundFreeSpot = nil
+            local foundSpotIdx = nil
+            for idx, spot in ipairs(spots) do
+                local rejectKey = string.format("%s:%s:%d", tostring(eq.unit_id), spotMode, idx)
+                if not self._rejectedSpots[rejectKey] and not self:IsSpotOccupiedByUnit(spot.pos, 2.2) then
+                    foundFreeSpot = spot
+                    foundSpotIdx = idx
+                    break
+                end
+            end
+
+            if foundFreeSpot then
+                if currentYen >= spawnCost then
+                    local cf = nil
+                    if GameModules.Util and type(GameModules.Util.CFramePLV) == "function" then
+                        cf = GameModules.Util.CFramePLV(foundFreeSpot.pos, foundFreeSpot.lookVec)
+                    else
+                        cf = CFrame.lookAt(foundFreeSpot.pos, foundFreeSpot.pos + foundFreeSpot.lookVec, Vector3.new(0, 1, 0))
+                    end
+
+                    local placedOk = false
+                    pcall(function()
+                        placedOk = GameModules:InvokeServer("spawn_unit", eq.uuid, cf) == true
+                    end)
+
+                    if placedOk then
+                        log(string.format("Placed unit %s (%d/%d) [%s] at (%.1f, %.1f, %.1f) cov=%d cost=%d",
+                            eq.unit_id, currentCount + 1, eq.spawn_cap, spotMode,
+                            foundFreeSpot.pos.X, foundFreeSpot.pos.Y, foundFreeSpot.pos.Z,
+                            foundFreeSpot.lenStuds or 0, spawnCost))
+                        return
+                    else
+                        local rejectKey = string.format("%s:%s:%d", tostring(eq.unit_id), spotMode, foundSpotIdx)
+                        self._rejectedSpots[rejectKey] = true
+                    end
+                else
+                    waitingForPlace = true
+                    break
+                end
+            end
+        end
+    end
+
+    -- 2. Upgrade spawned units (prioritize [late] catch-up units first when active, then lowest upgrade tier)
+    if not waitingForPlace and #myUnits > 0 then
+        table.sort(myUnits, function(a, b)
+            if desiredLate > 0 and a.isLate ~= b.isLate then
+                return a.isLate
+            end
+            if a.upgrade ~= b.upgrade then
+                return a.upgrade < b.upgrade
+            end
+            local defA = unitsData[a.unit_id]
+            local defB = unitsData[b.unit_id]
+            local rA = FARM_RARITY_RANK[defA and defA.rarity or "Common"] or 1
+            local rB = FARM_RARITY_RANK[defB and defB.rarity or "Common"] or 1
+            return rA > rB
+        end)
+
+        for _, u in ipairs(myUnits) do
+            local def = unitsData[u.unit_id]
+            local upgTable = def and def.upgrade
+            local nextUpg = (type(upgTable) == "table") and upgTable[u.upgrade + 1] or nil
+            if nextUpg and nextUpg.cost then
+                local upgMul = 1
+                if unitCore and session and type(unitCore.calculate_upgrade_cost_multiplier) == "function" then
+                    local okM, m = pcall(unitCore.calculate_upgrade_cost_multiplier, u.model, session)
+                    if okM and type(m) == "number" then upgMul = m end
+                end
+                local upgCost = math.ceil(tonumber(nextUpg.cost) * upgMul)
+                if currentYen >= upgCost then
+                    local upgOk = false
+                    pcall(function()
+                        upgOk = GameModules:InvokeServer("upgrade_unit_ingame", u.model) == true
+                    end)
+                    if upgOk then
+                        log(string.format("Upgraded %s [%s] to tier %d/%d (cost=%d)",
+                            u.unit_id, u.isLate and "late" or "main", u.upgrade + 1, #upgTable, upgCost))
+                        break
+                    end
+                else
+                    break
+                end
+            end
+        end
+    end
+
+    -- 3. Trigger Active Attacks if off cooldown
+    local nowTick = tick()
+    for _, u in ipairs(myUnits) do
+        local stats = u.model:FindFirstChild("_stats")
+        local activeVal = stats and stats:FindFirstChild("active_attack")
+        local cdVal = stats and stats:FindFirstChild("active_attack_cooldown")
+        local lastCastVal = stats and stats:FindFirstChild("last_active_cast")
+        if activeVal and activeVal.Value ~= "" and activeVal.Value ~= "nil" and cdVal and lastCastVal then
+            if (cdVal.Value - (nowTick - lastCastVal.Value)) <= 0 then
+                pcall(function()
+                    GameModules:InvokeServer("use_active_attack", u.model)
+                end)
+            end
+        end
+    end
+end
+
+function FarmService:IsStoryLevelCompleted(levelId)
+    local pData = (GameModules.Session and GameModules.Session.profile_data)
+        or (GameModules.StatsServiceClient and GameModules.StatsServiceClient.session and GameModules.StatsServiceClient.session.profile_data)
+    local completed = pData and pData.level_data and pData.level_data.completed_story_levels
+    local entry = type(completed) == "table" and completed[levelId] or nil
+    return type(entry) == "table" and (tonumber(entry.times_completed) or 0) > 0
+end
+
+function FarmService:GetDesiredStoryStage(worldId)
+    worldId = worldId or Config.FarmWorld or "namek"
+    local replayStage = Config.FarmLevel or (worldId .. "_level_1")
+    if Config.ClearWorldActsFirst ~= false then
+        for act = 1, 6 do
+            local stageId = string.format("%s_level_%d", worldId, act)
+            if not self:IsStoryLevelCompleted(stageId) then
+                return stageId, true
+            end
+        end
+    end
+    return replayStage, false
+end
+
+function FarmService:GetPostMatchAction(isVictory)
+    local currentLevel = GameModules:GetPlayerLevel()
+    local targetLevel = tonumber(Config.TargetFarmLevel) or 20
+    if not Config.AutoFarmEnabled or currentLevel >= targetLevel then
+        return "lobby", "target_level_reached"
+    end
+
+    local worldId = Config.FarmWorld or "namek"
+    local replayStage = Config.FarmLevel or (worldId .. "_level_1")
+    local curStageId = GameModules.Loader and GameModules.Loader.LevelData and GameModules.Loader.LevelData.id or nil
+
+    if not isVictory then
+        return "replay", "retry_defeat"
+    end
+
+    local curWorld, curActStr = string.match(tostring(curStageId or ""), "^([%w_]+)_level_(%d+)$")
+    local curAct = tonumber(curActStr)
+
+    if Config.ClearWorldActsFirst ~= false and curWorld == worldId and curAct then
+        if curAct < 6 then
+            for nextAct = curAct + 1, 6 do
+                local nextStageId = string.format("%s_level_%d", worldId, nextAct)
+                if not self:IsStoryLevelCompleted(nextStageId) then
+                    if nextAct == curAct + 1 then
+                        return "next_story", nextStageId
+                    else
+                        return "lobby", "select_" .. nextStageId
+                    end
+                end
+            end
+            -- All subsequent acts (curAct+1 .. 6) are already completed!
+            if curStageId ~= replayStage then
+                return "lobby", "return_to_" .. replayStage
+            end
+        elseif curAct >= 6 then
+            if curStageId ~= replayStage then
+                return "lobby", "finished_act6_return_to_" .. replayStage
+            end
+        end
+    elseif curStageId and curStageId ~= replayStage then
+        return "lobby", "switch_to_" .. replayStage
+    end
+
+    return "replay", curStageId or replayStage
+end
+
 function FarmService:EnterStoryMatch()
     if not GameModules.Loader or not GameModules.Loader.IsLobby then
         return false
@@ -1555,9 +2779,12 @@ function FarmService:EnterStoryMatch()
     local targetLevel = tonumber(Config.TargetFarmLevel) or 20
     log(string.format("Player Level (%d) < TargetFarmLevel (%d), entering Story match", playerLevel, targetLevel))
 
+    self:EquipBestTeam()
+
     local targetWorld = Config.FarmWorld or "namek"
-    local targetStage = Config.FarmLevel or "namek_level_6"
+    local targetStage, isFirstClearProgression = self:GetDesiredStoryStage(targetWorld)
     local difficulty = Config.FarmDifficulty or "Normal"
+    log(string.format("Selected Story stage: %s (mode=%s)", targetStage, isFirstClearProgression and "FirstClearAct1..6" or "ReplayAct1"))
 
     for attempt = 1, 10 do
         local lobbyModel = self:FindEmptyStoryLobby()
@@ -1571,7 +2798,7 @@ function FarmService:EnterStoryMatch()
             if joined then
                 task.wait(0.2)
 
-                -- Close any World Skip UI popup if open
+                -- Close any World Skip UI popup if open (never accept World Skip when ClearWorldActsFirst is active)
                 local guiService = GameModules.GUIService
                 if guiService and guiService.notification_windows_ui then
                     pcall(function()
@@ -1579,8 +2806,8 @@ function FarmService:EnterStoryMatch()
                     end)
                 end
 
-                -- Method 1: Use World Skip (lobby_world_skip) for instant teleport into Act 6
-                if Config.UseWorldSkip then
+                -- Optional World Skip (only if explicitly enabled AND ClearWorldActsFirst is false)
+                if Config.UseWorldSkip and Config.ClearWorldActsFirst == false then
                     log(string.format("Invoking lobby_world_skip('%s') for instant match start", targetWorld))
                     pcall(function()
                         GameModules:InvokeServer("lobby_world_skip", targetWorld)
@@ -1588,7 +2815,7 @@ function FarmService:EnterStoryMatch()
                     task.wait(1.5)
                 end
 
-                -- Method 2: Standard lock level + start game (if World Skip already completed or disabled)
+                -- Lock desired stage + start game
                 local locked = false
                 pcall(function()
                     locked = GameModules:InvokeServer("request_lock_level", lobbyModel.Name, targetStage, true, difficulty) == true
@@ -1642,9 +2869,10 @@ function FarmService:EnableAutoSkipSetting()
         end
         voteWaveUI.on_start_vote_wave_skip = function(uiSelf, ...)
             if Config.AutoSkipWaves then
+                local waveNum = (workspace:FindFirstChild("_wave_num") and tonumber(workspace._wave_num.Value)) or 0
                 local p = Players.LocalPlayer
                 if p and p:FindFirstChild("_settings") and p._settings:FindFirstChild("autoskip_waves") then
-                    p._settings.autoskip_waves.Value = true
+                    p._settings.autoskip_waves.Value = (waveNum <= 9)
                 end
             end
             return voteWaveUI._orig_on_start_vote_wave_skip(uiSelf, ...)
@@ -1662,7 +2890,15 @@ function FarmService:RunInGame()
     end
 
     self.Running = true
-    log("Starting In-Game AFK Loss & Replay loop")
+    log("Starting In-Game Auto Place & Win Farm loop")
+    self._spotCache = {}
+    self._rejectedSpots = {}
+    self._desiredLateUnits = 0
+    if GameModules.PlacementCore and type(GameModules.PlacementCore.init_on_map_made) == "function" then
+        pcall(function()
+            GameModules.PlacementCore.init_on_map_made()
+        end)
+    end
     self:EnableAutoSkipSetting()
     self:HookVoteStartUI()
     self:TriggerVoteStart()
@@ -1670,7 +2906,11 @@ function FarmService:RunInGame()
     task.spawn(function()
         local lastVoteStart = 0
         local lastVoteSkip = 0
+        local lastPlaceStep = 0
+        local lastReplayVote = 0
+        local placeBusyUntil = 0
         local handledResultsForMatch = false
+        local lastRematchLoadingId = GameModules.RematchServiceClient and GameModules.RematchServiceClient.loading_id or 0
 
         while self.Running do
             local guiService = GameModules.GUIService
@@ -1679,35 +2919,81 @@ function FarmService:RunInGame()
             local gameFinished = dataFolder and dataFolder:FindFirstChild("GameFinished") and dataFolder.GameFinished.Value
             local voteStartFolder = dataFolder and dataFolder:FindFirstChild("VoteStart")
             local votingFinished = voteStartFolder and voteStartFolder:FindFirstChild("VotingFinished") and voteStartFolder.VotingFinished.Value
+            local rematchActive = GameModules.RematchServiceClient and GameModules.RematchServiceClient.active
+            local curLoadingId = GameModules.RematchServiceClient and GameModules.RematchServiceClient.loading_id or 0
 
-            -- 1. Vote Start before match begins (and dismiss VoteStart UI if shown)
-            if Config.AutoVoteStart then
-                local startVoteUI = guiService and guiService.start_vote_ui
-                local uiShown = startVoteUI and startVoteUI.screenGUI and startVoteUI.screenGUI.Enabled
-                if (not gameStarted and not votingFinished) or uiShown then
-                    if os.clock() - lastVoteStart >= 0.25 then
-                        lastVoteStart = os.clock()
-                        self:TriggerVoteStart()
-                    end
+            if curLoadingId ~= lastRematchLoadingId and not rematchActive then
+                lastRematchLoadingId = curLoadingId
+                handledResultsForMatch = false
+                placeBusyUntil = 0
+                self._rejectedSpots = {}
+                self._desiredLateUnits = 0
+                if GameModules.PlacementCore and type(GameModules.PlacementCore.init_on_map_made) == "function" then
+                    pcall(function()
+                        GameModules.PlacementCore.init_on_map_made()
+                    end)
                 end
             end
 
-            -- 2. Vote Wave Skip fallback if VoteWaveUI prompt appears
-            if Config.AutoSkipWaves and gameStarted and not gameFinished then
-                local voteWaveUI = guiService and guiService.vote_wave_ui
-                if voteWaveUI and voteWaveUI.screenGUI and voteWaveUI.screenGUI.Enabled then
-                    if os.clock() - lastVoteSkip >= 0.25 then
-                        lastVoteSkip = os.clock()
-                        pcall(function()
-                            if GameModules:InvokeServer("vote_wave_skip") then
-                                voteWaveUI.screenGUI.Enabled = false
-                            end
+            -- 1. Vote Start before match begins (and dismiss VoteStart UI if shown)
+            if Config.AutoVoteStart and not rematchActive and not gameFinished then
+                local startVoteUI = guiService and guiService.start_vote_ui
+                local uiShown = startVoteUI and startVoteUI.screenGUI and startVoteUI.screenGUI.Enabled
+                if (not gameStarted and not votingFinished) or uiShown then
+                    if os.clock() - lastVoteStart >= 0.4 then
+                        lastVoteStart = os.clock()
+                        task.spawn(function()
+                            self:TriggerVoteStart()
                         end)
                     end
                 end
             end
 
-            -- 3. Handle match finish immediately (0ms delay on GameFinished or ResultsUI)
+            -- 2. Smart Wave Skip (instant on Waves 1..9, and on Waves 10..15 when alive enemies <= 2)
+            if Config.AutoSkipWaves and gameStarted and not gameFinished then
+                local waveNum = (workspace:FindFirstChild("_wave_num") and tonumber(workspace._wave_num.Value)) or 0
+                local p = Players.LocalPlayer
+                if p and p:FindFirstChild("_settings") and p._settings:FindFirstChild("autoskip_waves") then
+                    p._settings.autoskip_waves.Value = (waveNum <= 9)
+                end
+
+                local voteWaveUI = guiService and guiService.vote_wave_ui
+                if voteWaveUI and voteWaveUI.screenGUI and voteWaveUI.screenGUI.Enabled then
+                    if os.clock() - lastVoteSkip >= 0.35 then
+                        local canSkipNow = (waveNum <= 9)
+                        if not canSkipNow then
+                            local aliveEnemies = self:GetAliveEnemies()
+                            canSkipNow = (#aliveEnemies <= 2)
+                        end
+                        if canSkipNow then
+                            lastVoteSkip = os.clock()
+                            task.spawn(function()
+                                pcall(function()
+                                    if GameModules:InvokeServer("vote_wave_skip") then
+                                        voteWaveUI.screenGUI.Enabled = false
+                                    end
+                                end)
+                            end)
+                        end
+                    end
+                end
+            end
+
+            -- 2.5 Auto Place & Auto Upgrade equipped units during active match
+            if Config.AutoPlaceAndUpgrade and gameStarted and not gameFinished and os.clock() >= placeBusyUntil then
+                if os.clock() - lastPlaceStep >= 0.18 then
+                    lastPlaceStep = os.clock()
+                    placeBusyUntil = os.clock() + 2.0
+                    task.spawn(function()
+                        pcall(function()
+                            self:StepAutoPlaceAndUpgrade()
+                        end)
+                        placeBusyUntil = 0
+                    end)
+                end
+            end
+
+            -- 3. Handle match finish (non-blocking replay vote; never call show_unit_and_item_rewards which yields on BindableEvent)
             local resultsUI = guiService and guiService.results_ui
             local resultsShown = resultsUI and resultsUI.screenGUI and resultsUI.screenGUI.Enabled
             if gameFinished or resultsShown then
@@ -1715,40 +3001,114 @@ function FarmService:RunInGame()
                     pcall(function()
                         resultsUI.Holder.Visible = false
                         resultsUI.BG.Visible = false
-                        resultsUI:show_unit_and_item_rewards()
+                        resultsUI._show_finished = true
+                        if resultsUI.Finished then
+                            resultsUI.Finished.Visible = true
+                        end
                     end)
                 end
 
                 if not handledResultsForMatch then
                     handledResultsForMatch = true
-                    local currentLevel = GameModules:GetPlayerLevel()
-                    local targetLevel = tonumber(Config.TargetFarmLevel) or 20
+                    lastReplayVote = os.clock()
+                    placeBusyUntil = 0
+                    task.wait(0.35)
 
-                    if Config.AutoFarmEnabled and currentLevel < targetLevel then
-                        log(string.format("Match ended (Player Level: %d / %d) -> Voting Replay", currentLevel, targetLevel))
-                        pcall(function()
-                            GameModules:InvokeServer("set_game_finished_vote", "replay")
-                        end)
-                    else
-                        log(string.format("Target Level reached (%d >= %d) -> Returning to Lobby", currentLevel, targetLevel))
-                        pcall(function()
-                            GameModules:InvokeServer("teleport_back_to_lobby")
+                    local isVictory = false
+                    local baseHum = workspace:FindFirstChild("_BASES")
+                        and workspace._BASES:FindFirstChild("player")
+                        and workspace._BASES.player:FindFirstChild("base")
+                        and workspace._BASES.player.base:FindFirstChild("fake_unit")
+                        and workspace._BASES.player.base.fake_unit:FindFirstChildOfClass("Humanoid")
+                    if baseHum then
+                        isVictory = (baseHum.Health > 0)
+                    elseif resultsUI and resultsUI.settings and resultsUI.settings.victory ~= nil then
+                        isVictory = (resultsUI.settings.victory == true)
+                    end
+                    local resultStr = isVictory and "Victory" or "Defeat"
+
+                    if DailyService and DailyService.ClaimCompletedQuests then
+                        task.spawn(function()
+                            pcall(function()
+                                DailyService:ClaimCompletedQuests()
+                            end)
                         end)
                     end
-                else
+
+                    if TrackerService and TrackerService.PushFarm then
+                        task.spawn(function()
+                            pcall(function()
+                                local waveVal = (workspace:FindFirstChild("_wave_num") and workspace._wave_num.Value)
+                                    or (dataFolder and dataFolder:FindFirstChild("Wave") and dataFolder.Wave.Value)
+                                    or 0
+                                TrackerService:PushFarm({
+                                    level = tostring(GameModules:GetPlayerLevel()),
+                                    world = Config.FarmWorld or "Story",
+                                    difficulty = Config.FarmDifficulty or "Normal",
+                                    wave = waveVal,
+                                    result = resultStr,
+                                })
+                            end)
+                        end)
+                    end
+
                     local currentLevel = GameModules:GetPlayerLevel()
                     local targetLevel = tonumber(Config.TargetFarmLevel) or 20
-                    pcall(function()
-                        if Config.AutoFarmEnabled and currentLevel < targetLevel then
-                            GameModules:InvokeServer("set_game_finished_vote", "replay")
-                        else
-                            GameModules:InvokeServer("teleport_back_to_lobby")
-                        end
+                    local currentGems = GameModules:GetGemAmount()
+                    local postAction, postReason = self:GetPostMatchAction(isVictory)
+                    self._lastPostAction = postAction
+
+                    if postAction == "next_story" then
+                        log(string.format("Match %s (Lv.%d/%d | Gems: %d) -> Advancing to Next Story Act (%s)",
+                            resultStr, currentLevel, targetLevel, currentGems, tostring(postReason)))
+                        task.spawn(function()
+                            pcall(function()
+                                GameModules:InvokeServer("set_game_finished_vote", "next_story")
+                            end)
+                        end)
+                    elseif postAction == "replay" then
+                        log(string.format("Match %s (Lv.%d/%d | Gems: %d) -> Voting Replay (%s)",
+                            resultStr, currentLevel, targetLevel, currentGems, tostring(postReason)))
+                        task.spawn(function()
+                            pcall(function()
+                                GameModules:InvokeServer("set_game_finished_vote", "replay")
+                            end)
+                        end)
+                    else
+                        log(string.format("Match %s (Lv.%d/%d | Gems: %d) -> Returning to Lobby (%s)",
+                            resultStr, currentLevel, targetLevel, currentGems, tostring(postReason)))
+                        task.spawn(function()
+                            pcall(function()
+                                GameModules:InvokeServer("teleport_back_to_lobby")
+                            end)
+                        end)
+                    end
+                elseif not rematchActive and (os.clock() - lastReplayVote >= 4.0) then
+                    lastReplayVote = os.clock()
+                    local postAction = self._lastPostAction or "replay"
+                    task.spawn(function()
+                        pcall(function()
+                            if postAction == "next_story" then
+                                GameModules:InvokeServer("set_game_finished_vote", "next_story")
+                            elseif postAction == "replay" then
+                                GameModules:InvokeServer("set_game_finished_vote", "replay")
+                            else
+                                GameModules:InvokeServer("teleport_back_to_lobby")
+                            end
+                        end)
                     end)
-                    task.wait(1.0)
                 end
             else
-                handledResultsForMatch = false
+                if handledResultsForMatch then
+                    handledResultsForMatch = false
+                    placeBusyUntil = 0
+                    self._rejectedSpots = {}
+                    self._desiredLateUnits = 0
+                    local startVoteUI = guiService and guiService.start_vote_ui
+                    if startVoteUI then
+                        startVoteUI.voted = false
+                    end
+                end
             end
 
             task.wait(0.15)
@@ -2017,11 +3377,12 @@ function PerformanceService:CleanMapAndTerrain()
         end))
     end
 
-    -- 2. Clear decorative folders in workspace._terrain while keeping "ground" for raycasts
+    -- 2. Clear decorative folders in workspace._terrain while keeping "ground", "hill", "terrain" for PlacementCore raycasts
     local terrainFolder = workspace:FindFirstChild("_terrain")
     if terrainFolder then
+        local keepTerrainFolders = { ground = true, hill = true, terrain = true }
         for _, child in ipairs(terrainFolder:GetChildren()) do
-            if child.Name ~= "ground" then
+            if not keepTerrainFolders[child.Name] then
                 pcall(function()
                     child:Destroy()
                     removedCount = removedCount + 1
@@ -2031,18 +3392,51 @@ function PerformanceService:CleanMapAndTerrain()
                     self:StripInstanceVisuals(desc)
                     if desc:IsA("BasePart") then
                         desc.Transparency = 1
+                        desc.CastShadow = false
                     end
                 end
             end
         end
+        if GameModules.PlacementCore and type(GameModules.PlacementCore.init_on_map_made) == "function" then
+            pcall(function()
+                GameModules.PlacementCore.init_on_map_made()
+            end)
+        end
     end
 
-    -- 3. Hide _road and _water_blocks visuals while keeping instances alive
+    -- 3. Hide _road, _water_blocks, and _BASES visuals completely (Transparency = 1) while keeping instances alive for raycasts
     for _, folderName in ipairs({ "_road", "_water_blocks", "_BASES" }) do
         local f = workspace:FindFirstChild(folderName)
         if f then
             for _, desc in ipairs(f:GetDescendants()) do
                 self:StripInstanceVisuals(desc)
+                if desc:IsA("BasePart") then
+                    pcall(function()
+                        desc.Transparency = 1
+                        desc.CastShadow = false
+                    end)
+                end
+            end
+        end
+    end
+
+    -- 4. Hide LocalPlayer character parts & stop character Animator in match
+    local localPlayer = Players.LocalPlayer
+    if localPlayer and localPlayer.Character then
+        for _, desc in ipairs(localPlayer.Character:GetDescendants()) do
+            self:StripInstanceVisuals(desc)
+            if desc:IsA("BasePart") then
+                pcall(function()
+                    desc.Transparency = 1
+                    desc.CastShadow = false
+                end)
+            elseif desc:IsA("Animator") then
+                pcall(function()
+                    for _, track in ipairs(desc:GetPlayingAnimationTracks()) do
+                        track:Stop(0)
+                    end
+                    desc:Destroy()
+                end)
             end
         end
     end
@@ -2066,19 +3460,22 @@ function PerformanceService:StripUnitModel(unitModel)
         }
 
         for _, desc in ipairs(unitModel:GetDescendants()) do
-            if stripChildNames[desc.Name] or desc:IsA("Accessory") or desc:IsA("Clothing") or desc:IsA("CharacterMesh") or desc:IsA("SpecialMesh") or desc:IsA("ParticleEmitter") or desc:IsA("Trail") or desc:IsA("Beam") or desc:IsA("Decal") or desc:IsA("Texture") or desc:IsA("Highlight") then
+            if stripChildNames[desc.Name] or desc:IsA("Accessory") or desc:IsA("Clothing") or desc:IsA("CharacterMesh") or desc:IsA("SpecialMesh") or desc:IsA("ParticleEmitter") or desc:IsA("Trail") or desc:IsA("Beam") or desc:IsA("Decal") or desc:IsA("Texture") or desc:IsA("Highlight") or desc:IsA("Animator") or desc:IsA("AnimationController") then
                 pcall(function()
+                    if desc:IsA("Animator") then
+                        for _, track in ipairs(desc:GetPlayingAnimationTracks()) do
+                            track:Stop(0)
+                        end
+                    end
                     desc:Destroy()
                 end)
             elseif desc:IsA("BasePart") then
                 pcall(function()
                     desc.Material = Enum.Material.SmoothPlastic
                     desc.CastShadow = false
-                    if desc.Name ~= "HumanoidRootPart" then
-                        desc.Transparency = 1
-                    end
+                    desc.Transparency = 1
                 end)
-            elseif desc:IsA("BillboardGui") and desc.Name == "_overhead" then
+            elseif desc:IsA("BillboardGui") or desc:IsA("SurfaceGui") then
                 pcall(function()
                     desc.Enabled = false
                 end)
@@ -2422,30 +3819,63 @@ function KaitunUIService:Create()
     btnCorner.Parent = toggleBtn
 
     self.IsHidden = false
-    if Config.Disable3DRenderingWhenUIShown then
+    self.HiddenGameGuis = {}
+
+    local function ApplyOverlayRenderState()
+        local RunService = game:GetService("RunService")
+        local localPlayer = Players.LocalPlayer
+        local pg = localPlayer and localPlayer:FindFirstChild("PlayerGui")
+
+        if Config.HideGameUIsWhenOverlayShown and pg then
+            local heavyGuiNames = {
+                "spawn_units", "UnitOverview", "UnitUpgrade2", "GameLevelInfo",
+                "LeftUI_test", "Minimap", "Waves", "BossHealth", "NotificationWindows",
+                "MessageGui", "GUIFX", "TimeErase", "TransitionUI", "_UnitPointer",
+            }
+            if not self.IsHidden then
+                for _, gName in ipairs(heavyGuiNames) do
+                    local g = pg:FindFirstChild(gName)
+                    if g and g:IsA("ScreenGui") and g.Enabled then
+                        self.HiddenGameGuis[gName] = true
+                        pcall(function() g.Enabled = false end)
+                    end
+                end
+            else
+                for gName, wasEnabled in pairs(self.HiddenGameGuis) do
+                    if wasEnabled then
+                        local g = pg:FindFirstChild(gName)
+                        if g and g:IsA("ScreenGui") then
+                            pcall(function() g.Enabled = true end)
+                        end
+                    end
+                end
+                self.HiddenGameGuis = {}
+            end
+        end
+
         pcall(function()
-            game:GetService("RunService"):Set3dRenderingEnabled(false)
+            if Config.Disable3DRenderingInMatch and GameModules.Loader and not GameModules.Loader.IsLobby then
+                RunService:Set3dRenderingEnabled(false)
+            elseif not self.IsHidden and (Config.Disable3DRenderingWhenUIShown or Config.DutyCycle3DRendering) then
+                RunService:Set3dRenderingEnabled(false)
+            else
+                RunService:Set3dRenderingEnabled(true)
+            end
         end)
     end
+
+    ApplyOverlayRenderState()
 
     toggleBtn.MouseButton1Click:Connect(function()
         self.IsHidden = not self.IsHidden
         container.Visible = not self.IsHidden
         bg.Visible = not self.IsHidden
         toggleBtn.Text = self.IsHidden and "+" or "-"
-
-        pcall(function()
-            if Config.Disable3DRenderingInMatch and GameModules.Loader and not GameModules.Loader.IsLobby then
-                game:GetService("RunService"):Set3dRenderingEnabled(false)
-            elseif Config.Disable3DRenderingWhenUIShown then
-                game:GetService("RunService"):Set3dRenderingEnabled(self.IsHidden)
-            else
-                game:GetService("RunService"):Set3dRenderingEnabled(true)
-            end
-        end)
+        ApplyOverlayRenderState()
     end)
 
     task.spawn(function()
+        local RunService = game:GetService("RunService")
         while sg and sg.Parent do
             pcall(function()
                 local startTime = (type(getgenv) == "function" and getgenv()._KaitunStartTime) or os.time()
@@ -2487,8 +3917,18 @@ function KaitunUIService:Create()
                         totalC
                     )
                 end
+
+                -- Single-frame swapchain pulse for DutyCycle3DRendering (~0-2% GPU while keeping Kaitun UI live)
+                if not self.IsHidden and Config.DutyCycle3DRendering and not Config.Disable3DRenderingWhenUIShown and not Config.Disable3DRenderingInMatch then
+                    ApplyOverlayRenderState()
+                    RunService:Set3dRenderingEnabled(true)
+                    RunService.RenderStepped:Wait()
+                    if not self.IsHidden then
+                        RunService:Set3dRenderingEnabled(false)
+                    end
+                end
             end)
-            task.wait(0.5)
+            task.wait(tonumber(Config.DutyCycleInterval) or 1.0)
         end
     end)
 
@@ -2499,510 +3939,931 @@ end
 -- UNIT IMAGE CDN TABLE (503 Mapped Playable Units)
 -- ============================================================================
 UnitImages.Map = {
-    ["ace"] = "https://static.wikia.nocookie.net/animeadventures/images/a/ad/Fire_Fist.png/revision/latest",
-    ["ainz"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d1/Supreme_Being.png/revision/latest",
-    ["ainz_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/26/Supreme_Being_%28Sovereign%29.png/revision/latest",
-    ["aizen"] = "https://static.wikia.nocookie.net/animeadventures/images/a/af/Illusionist.png/revision/latest",
-    ["aizen_christmas"] = "https://static.wikia.nocookie.net/animeadventures/images/f/fa/Illusionist_%28Transcended%29.png/revision/latest",
-    ["aizen_chrys"] = "https://static.wikia.nocookie.net/animeadventures/images/1/18/Illusionist_%28Chrysalis%29.png/revision/latest",
-    ["aizen_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c5/Illusionist_%28Betrayal%29.png/revision/latest",
-    ["aizen_hog"] = "https://static.wikia.nocookie.net/animeadventures/images/2/25/Illusionist_%28Fusion%29.png/revision/latest",
-    ["aizen_hog_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b7/Illusionist_%28Final%29.png/revision/latest",
-    ["akainu"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f9/Magma.png/revision/latest",
-    ["akainu_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/6f/Fleet_Admiral_Magma.png/revision/latest",
-    ["akaza_unit"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3e/Martial_Demon.png/revision/latest",
-    ["akaza_unit_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/7a/Martial_Demon_%28Destruction%29.png/revision/latest",
-    ["akeno"] = "https://static.wikia.nocookie.net/animeadventures/images/b/ba/Akemy.png/revision/latest",
-    ["akeno_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/71/Akemy_%28Fallen_Angel%29.png/revision/latest",
-    ["aki"] = "https://static.wikia.nocookie.net/animeadventures/images/8/85/Curse.png/revision/latest",
-    ["aki_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/f/fc/Curse_%28Contract%29.png/revision/latest",
-    ["akutagawa"] = "https://static.wikia.nocookie.net/animeadventures/images/c/cd/Black_Dog.png/revision/latest",
-    ["akutagawa_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/58/Black_Dog_%28HellHound%29.png/revision/latest",
-    ["albedo"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4f/Cherub.png/revision/latest",
-    ["albedo_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f0/Cherub_%28Overseer%29.png/revision/latest",
-    ["all_might"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a4/Prime_Force.png/revision/latest",
-    ["all_might_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b4/Prime_Force_%28Peace%29.png/revision/latest",
-    ["alucard"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8f/Dracula.png/revision/latest",
-    ["alucard_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8f/Dracula.png/revision/latest",
-    ["android21"] = "https://static.wikia.nocookie.net/animeadventures/images/0/06/Android_AAA.png/revision/latest",
-    ["angel_devil"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1e/Paragon.png/revision/latest",
-    ["angel_devil_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/31/Paragon_%28Devil%29.png/revision/latest",
-    ["aokiji"] = "https://static.wikia.nocookie.net/animeadventures/images/5/58/Frost_Navy.png/revision/latest",
-    ["aokiji_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/15/Frost_Navy_%28Blue_Pigeon%29.png/revision/latest",
-    ["archer"] = "https://static.wikia.nocookie.net/animeadventures/images/7/78/Faker.png/revision/latest",
-    ["archer_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/51/Faker_%28Hero%27s_Soul%29.png/revision/latest",
-    ["arima"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1f/Ariva.png/revision/latest",
-    ["arima_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c5/Ariva_%28Reaper%29.png/revision/latest",
-    ["armin"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d1/Arlem.png/revision/latest",
-    ["asta"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1f/Magic_Disbeliever.png/revision/latest",
-    ["asta_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/9/93/Magic_Disbeliever_%28Dark%29.png/revision/latest",
-    ["asuna"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3f/Gamer_Girl.png/revision/latest",
-    ["asuna_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b1/Gamer_Girl_%28Flash%29.png/revision/latest",
-    ["atsushi"] = "https://static.wikia.nocookie.net/animeadventures/images/a/ae/Tiger.png/revision/latest",
-    ["atsushi_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d3/Tiger_%28Moonlight_Beast%29.png/revision/latest",
-    ["avdol"] = "https://static.wikia.nocookie.net/animeadventures/images/6/66/Flamefeather.png/revision/latest",
-    ["avdol_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/61/Flamefeather_%28Arcane_Blaze%29.png/revision/latest",
-    ["bakugou"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8f/Explosion_Hero.png/revision/latest",
-    ["bakugou_2"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e4/Explosion_Hero_%28Bang%29.png/revision/latest",
-    ["bakugou_2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/70/Explosion_Hero_%28Impact%29.png/revision/latest",
-    ["bambietta"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c9/Bombietta.png/revision/latest",
-    ["ban"] = "https://static.wikia.nocookie.net/animeadventures/images/1/10/Crimson_Thief.png/revision/latest",
-    ["ban_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/ac/Crimson_Thief_%28Hunt%29.png/revision/latest",
-    ["bang"] = "https://static.wikia.nocookie.net/animeadventures/images/c/cb/Waterfist.png/revision/latest",
-    ["bang_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c0/Waterfist_%28White_Tooth%29.png/revision/latest",
-    ["bee_girl"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c6/Honey.png/revision/latest",
-    ["bee_girl_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/cb/Honey_%28Hive%29.png/revision/latest",
-    ["blackbeard"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0a/Blackhair.png/revision/latest",
-    ["boa"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0a/Snake_Princess.png/revision/latest",
-    ["boros"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0a/Alien_King.png/revision/latest",
-    ["boros_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1b/Lord_Alien_King.png/revision/latest",
-    ["boxxo"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a6/Dispenser.png/revision/latest",
-    ["broly"] = "https://static.wikia.nocookie.net/animeadventures/images/5/5c/Bro.png/revision/latest",
-    ["broly_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/d/db/Super_Bro.png/revision/latest",
-    ["brook"] = "https://static.wikia.nocookie.net/animeadventures/images/2/23/Skeleton.png/revision/latest",
-    ["brook_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2d/Skeleton_%28Soul_King%29.png/revision/latest",
-    ["buddha"] = "https://static.wikia.nocookie.net/animeadventures/images/f/fd/Enlightened.png/revision/latest",
-    ["buddha_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/36/Enlightened_%28Nirvana%29.png/revision/latest",
-    ["buggy"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4d/Stitches.png/revision/latest",
-    ["bulma"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e3/Bulby.png/revision/latest",
-    ["buu"] = "https://static.wikia.nocookie.net/animeadventures/images/0/02/Bubblegum.png/revision/latest",
-    ["buu_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3d/Bubblegum_%28Ultimate%29.png/revision/latest",
-    ["caesar"] = "https://static.wikia.nocookie.net/animeadventures/images/3/33/Julias.png/revision/latest",
-    ["caesarclown"] = "https://static.wikia.nocookie.net/animeadventures/images/7/78/Gas.png/revision/latest",
-    ["caesarclown_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c0/Gas_%28Toxic%29.png/revision/latest",
-    ["carrot"] = "https://static.wikia.nocookie.net/animeadventures/images/8/82/Bunny.png/revision/latest",
-    ["carrot_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/73/Bunny_%28Night%29.png/revision/latest",
-    ["cell_imperfect"] = "https://static.wikia.nocookie.net/animeadventures/images/7/7e/Experiment_X_%28Imperfect%29.png/revision/latest",
-    ["cell_perfect"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8b/Experiment_X_%28Perfect%29.png/revision/latest",
-    ["cell_semi_perfect"] = "https://static.wikia.nocookie.net/animeadventures/images/b/bf/Experiment_X_%28Semi-Perfect%29.png/revision/latest",
-    ["cell_super_perfect"] = "https://static.wikia.nocookie.net/animeadventures/images/5/58/Experiment_X_%28SUPER_PERFECT%29.png/revision/latest",
-    ["chad"] = "https://static.wikia.nocookie.net/animeadventures/images/f/fa/Brawler.png/revision/latest",
-    ["chad_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/01/Brawler_%28Soul%29.png/revision/latest",
-    ["charmy"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c3/Cotton.png/revision/latest",
-    ["charmy_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4f/Cotton_%28Sheep%29.png/revision/latest",
-    ["chihiro"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3b/Vengeful_Swordsman.png/revision/latest",
-    ["chihiro_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/55/Vengeful_Swordsman_%28Sky_Reaver%29.png/revision/latest",
-    ["chika"] = "https://static.wikia.nocookie.net/animeadventures/images/9/92/Spirit_Sniper.png/revision/latest",
-    ["chika_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/05/Spirit_Sniper_%28Prodigy%29.png/revision/latest",
-    ["chuya"] = "https://static.wikia.nocookie.net/animeadventures/images/6/6d/Gravity_Mage.png/revision/latest",
-    ["chuya_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0c/Gravity_Mage_%28Void%29.png/revision/latest",
-    ["cid"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a2/Umbra.png/revision/latest",
-    ["cid_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2e/Umbra_%28Nuclear%29.png/revision/latest",
-    ["conrad"] = "https://static.wikia.nocookie.net/animeadventures/images/4/44/Connor.png/revision/latest",
-    ["conrad_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/4/44/Connor_%28Wizard_King%29.png/revision/latest",
-    ["cooler"] = "https://static.wikia.nocookie.net/animeadventures/images/6/66/Fridge.png/revision/latest",
-    ["cranel"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0c/Player.png/revision/latest",
-    ["cranel_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d6/Player_%28Argus%29.png/revision/latest",
-    ["dabi"] = "https://static.wikia.nocookie.net/animeadventures/images/0/06/Scorch.png/revision/latest",
-    ["daki"] = "https://static.wikia.nocookie.net/animeadventures/images/9/96/Saka.png/revision/latest",
-    ["daki_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/39/Saka_%28Ribbon%29.png/revision/latest",
-    ["dazai"] = "https://static.wikia.nocookie.net/animeadventures/images/9/9a/InHuman.png/revision/latest",
-    ["dazai_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4b/InHuman_%28Nullifier%29.png/revision/latest",
-    ["deku"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3a/Verdant_Hero.png/revision/latest",
-    ["deku_vigilante"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a7/Verdant_Hero_%28String%29.png/revision/latest",
-    ["deku_vigilante_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/73/Verdant_Hero_%28Dark%29.png/revision/latest",
-    ["demiurge"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f1/Lucifer.png/revision/latest",
-    ["demiurge_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0b/Lucifer_%28Demon_Emperor%29.png/revision/latest",
-    ["denji"] = "https://static.wikia.nocookie.net/animeadventures/images/0/03/Blade_Beast.png/revision/latest",
-    ["denji_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3d/Blade_Beast_%28Hybrid%29.png/revision/latest",
-    ["denji_secret"] = "https://static.wikia.nocookie.net/animeadventures/images/3/38/Blade_Beast_%28Past%29.png/revision/latest",
-    ["diane"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0e/Hammer_Giantess.png/revision/latest",
-    ["diane_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/19/Hammer_Giantess_%28Creation%29.png/revision/latest",
-    ["diavolo"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e8/Devil_Boss.png/revision/latest",
-    ["dio_heaven"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d4/JIO_%28Over_Heaven%29.png/revision/latest",
-    ["doflamingo"] = "https://static.wikia.nocookie.net/animeadventures/images/e/ef/Stringy.png/revision/latest",
-    ["doflamingo_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e8/Stringy_%28Awakened%29.png/revision/latest",
-    ["dokuro"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a6/Violentine.png/revision/latest",
-    ["dokuro_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/74/Violentine_%28Brutal_Angel%29.png/revision/latest",
-    ["dominico"] = "https://static.wikia.nocookie.net/animeadventures/images/d/df/Weather.png/revision/latest",
-    ["dominico_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/67/Heavy_Weather.png/revision/latest",
-    ["elyssia"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d4/Elyssia.png/revision/latest",
-    ["elyssia_eel"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d4/Elyssia.png/revision/latest",
-    ["elyssia_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/cb/Elyssia_%28Abyssal%29.png/revision/latest",
-    ["emilia"] = "https://static.wikia.nocookie.net/animeadventures/images/4/45/Ice_Lily.png/revision/latest",
-    ["endeavor"] = "https://static.wikia.nocookie.net/animeadventures/images/9/94/Flame_Hero.png/revision/latest",
-    ["endeavor_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3d/Flame_Hero_%28Hellfire%29.png/revision/latest",
-    ["eren_final"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f9/Usurper_%28Founder%29.png/revision/latest",
-    ["ermes"] = "https://static.wikia.nocookie.net/animeadventures/images/9/9d/Hermy.png/revision/latest",
-    ["ermes_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/20/Hermy_%28Duplicate%29.png/revision/latest",
-    ["erwin"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2e/Commander.png/revision/latest",
-    ["erza"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c9/Elize.png/revision/latest",
-    ["erza_evolved__placeholder"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c9/Elize.png/revision/latest",
-    ["erza_lightning"] = "https://static.wikia.nocookie.net/animeadventures/images/d/dd/Unknown.png/revision/latest",
-    ["erza_samurai"] = "https://static.wikia.nocookie.net/animeadventures/images/4/46/Elize_%28True_Heart%29.png/revision/latest",
-    ["erza_valkyrie"] = "https://static.wikia.nocookie.net/animeadventures/images/3/34/Elize_%28Valkyrie%29.png/revision/latest",
-    ["escanor"] = "https://static.wikia.nocookie.net/animeadventures/images/d/dd/Unknown.png/revision/latest",
-    ["escanor_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/66/Hubris_%28The_One%29.png/revision/latest",
-    ["escanor_weak"] = "https://static.wikia.nocookie.net/animeadventures/images/c/ce/Hubris_%28Night%29.png/revision/latest",
-    ["esdeath"] = "https://static.wikia.nocookie.net/animeadventures/images/9/9f/Ice_Queen.png/revision/latest",
-    ["esdeath_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/7e/Ice_Queen_%28Empire%27s_Strongest%29.png/revision/latest",
-    ["eto"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b3/Eta.png/revision/latest",
-    ["eto_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b8/Eta_%28One-Eye%29.png/revision/latest",
-    ["evileye"] = "https://static.wikia.nocookie.net/animeadventures/images/4/42/Crystal_Rose.png/revision/latest",
-    ["evileye_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/cb/Crystal_Rose_%28Impact%29.png/revision/latest",
-    ["feitan"] = "https://static.wikia.nocookie.net/animeadventures/images/8/84/Spider.png/revision/latest",
-    ["feitan_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d3/Spider_%28Immolation%29.png/revision/latest",
-    ["femto"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2a/Griffin_%28Darkness%29.png/revision/latest",
-    ["femto_egg"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a5/Griffin_%28Ascension%29.png/revision/latest",
-    ["frieren"] = "https://static.wikia.nocookie.net/animeadventures/images/5/5b/Elf_Mage.png/revision/latest",
-    ["frieren_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2d/Elf_Mage_%28Aura%29.png/revision/latest",
-    ["frieza_golden"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4c/Golden_Tyrant.png/revision/latest",
-    ["frieza_golden_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/ef/Golden_Tyrant_%28Emperor%29.png/revision/latest",
-    ["fugo"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e8/Haze.png/revision/latest",
-    ["fugo_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1a/Haze_%28Rage%29.png/revision/latest",
-    ["fujitora"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8b/Gravity_Navy.png/revision/latest",
-    ["fujitora_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/5f/Gravity_Navy_%28Admiral%29.png/revision/latest",
-    ["future_gohan"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b1/Future_Goh.png/revision/latest",
-    ["gabimaru"] = "https://static.wikia.nocookie.net/animeadventures/images/8/87/Flower_Ninja.png/revision/latest",
-    ["gabimaru_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/70/Flower_Ninja_%28Austere_Flame%29.png/revision/latest",
-    ["gaku"] = "https://static.wikia.nocookie.net/animeadventures/images/3/33/Killstreak.png/revision/latest",
-    ["gaku_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2e/Killstreak_%28Speedrun%29.png/revision/latest",
-    ["genos_2"] = "https://static.wikia.nocookie.net/animeadventures/images/e/ed/Cyborg_%28Overdrive%29.png/revision/latest",
-    ["genos_2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/65/Cyborg_%28Incinerate%29.png/revision/latest",
-    ["geten"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8b/Ice_Shaper.png/revision/latest",
-    ["geto"] = "https://static.wikia.nocookie.net/animeadventures/images/0/04/Gazu.png/revision/latest",
-    ["geto_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4e/Gazu_%28Maximum%29.png/revision/latest",
-    ["ghiaccio"] = "https://static.wikia.nocookie.net/animeadventures/images/3/39/Skater.png/revision/latest",
-    ["ghiaccio_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2f/Skater_%28Album%29.png/revision/latest",
-    ["ghostkun"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b0/Ghost-kun.png/revision/latest",
-    ["ghostkun_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/8/88/Ghost-kun_%28Bound%29.png/revision/latest",
-    ["gildarts"] = "https://static.wikia.nocookie.net/animeadventures/images/1/15/Crush.png/revision/latest",
-    ["gildarts_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b1/Crush_%28Ace%29.png/revision/latest",
-    ["gilgamesh"] = "https://static.wikia.nocookie.net/animeadventures/images/5/53/Golden_King.png/revision/latest",
-    ["gilgamesh_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/ec/Golden_King_%28Lord_of_Heroes%29.png/revision/latest",
-    ["gin"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e6/White_Snake.png/revision/latest",
-    ["gin_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/35/White_Snake_%28Sacred_Spear%29.png/revision/latest",
-    ["giselle"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c3/Zombie.png/revision/latest",
-    ["giselle_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/6d/Zombie_%28Risen%29.png/revision/latest",
-    ["gogeta_failed"] = "https://static.wikia.nocookie.net/animeadventures/images/c/cf/%3F%3F%3F.png/revision/latest",
-    ["gogeta_failed__placeholder"] = "https://static.wikia.nocookie.net/animeadventures/images/c/cf/%3F%3F%3F.png/revision/latest",
-    ["gojo"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b0/Paradox.png/revision/latest",
-    ["gojo_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3b/Paradox_%28Divine_Sight%29.png/revision/latest",
-    ["goku"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3d/Goko_Deployment_Card.png/revision/latest",
-    ["goku_ssj3"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0c/Carrot_%28Super_III%29.png/revision/latest",
-    ["goku_ssj3_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2d/Carrot_%28Ultra%29.png/revision/latest",
-    ["gon_adult"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a5/Gene_%28Adult%29.png/revision/latest",
-    ["gon_adult_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/10/%3F%3F%3F_%28Pose%29.png/revision/latest",
-    ["gowther"] = "https://static.wikia.nocookie.net/animeadventures/images/f/fb/Doll.png/revision/latest",
-    ["gowther_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/02/Doll_%28Spirit_Archer%29.png/revision/latest",
-    ["gray"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c6/Cold_Mage.png/revision/latest",
-    ["gray_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/ad/Cold_Mage_%28Devil_Slayer%29.png/revision/latest",
-    ["gremmy"] = "https://static.wikia.nocookie.net/animeadventures/images/2/29/Dreamer.png/revision/latest",
-    ["gremmy_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c0/Dreamer_%28Visionary%29.png/revision/latest",
-    ["griffith"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f8/Griffin.png/revision/latest",
-    ["griffith_reincarnation"] = "https://static.wikia.nocookie.net/animeadventures/images/5/51/Griffin_%28Reincarnation%29.png/revision/latest",
-    ["grimmjow_res"] = "https://static.wikia.nocookie.net/animeadventures/images/4/41/Iceclaw_%28Rebirth%29.png/revision/latest",
-    ["grimmjow_res_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3f/Iceclaw_%28Azure_Fang%29.png/revision/latest",
-    ["guts"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a8/Berserker.png/revision/latest",
-    ["guts_berserker"] = "https://static.wikia.nocookie.net/animeadventures/images/7/77/Berserker_%28Rage%29.png/revision/latest",
-    ["gyutaro"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b1/Sepsis.png/revision/latest",
-    ["gyutaro_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/63/Sepsis_%28Moon%29.png/revision/latest",
-    ["hakari"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8a/Gambler.png/revision/latest",
-    ["hakari_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/32/Gambler_%28Jackpot%29.png/revision/latest",
-    ["haku"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c7/Mirror_Ninja.png/revision/latest",
-    ["haku_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/55/Mirror_Ninja_%28Reflection%29.png/revision/latest",
-    ["hange"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4e/Eccentric_Researcher.png/revision/latest",
-    ["hange_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f3/Eccentric_Researcher_%28Captain%29.png/revision/latest",
-    ["harribel"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e1/Hammerhead.png/revision/latest",
-    ["harribel_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/71/Hammerhead_%28Shark_Empress%29.png/revision/latest",
-    ["hawks"] = "https://static.wikia.nocookie.net/animeadventures/images/0/06/Falcon.png/revision/latest",
-    ["hawks_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/36/Falcon_%28Feather_Strike%29.png/revision/latest",
-    ["heathcliff"] = "https://static.wikia.nocookie.net/animeadventures/images/e/eb/Crusader.png/revision/latest",
-    ["heathcliff_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/9/9b/Crusader_%28Admin%29.png/revision/latest",
-    ["hei"] = "https://static.wikia.nocookie.net/animeadventures/images/5/50/Black_Assassin.png/revision/latest",
-    ["hei_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/9/9b/Black_Assassin_%28Reaper%29.png/revision/latest",
-    ["hidan_unit"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f5/Death_Ninja.png/revision/latest",
-    ["hidan_unit_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1f/Death_Ninja_%28Immortal_Butcher%29.png/revision/latest",
-    ["hiei"] = "https://static.wikia.nocookie.net/animeadventures/images/f/fe/Demonshade.png/revision/latest",
-    ["himeno"] = "https://static.wikia.nocookie.net/animeadventures/images/5/53/Ghosty.png/revision/latest",
-    ["himeno_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/02/Ghosty_%28Sacrifice%29.png/revision/latest",
-    ["hinami"] = "https://static.wikia.nocookie.net/animeadventures/images/9/95/Fiend_Girl.png/revision/latest",
-    ["hinami_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/d/dd/Unknown.png/revision/latest",
-    ["homura"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d9/Shadowgirl.png/revision/latest",
-    ["homura_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/b/be/Shadowgirl_%28Time_Traveller%29_%28Pose%29.png/revision/latest",
-    ["hoshino"] = "https://static.wikia.nocookie.net/animeadventures/images/0/07/Idol.png/revision/latest",
-    ["hoshino_2"] = "https://static.wikia.nocookie.net/animeadventures/images/0/07/Idol.png/revision/latest",
-    ["hoshino_2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/65/Idol_%28Star%29.png/revision/latest",
-    ["hoshino_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/65/Idol_%28Star%29.png/revision/latest",
-    ["ichigo"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b5/Ichi_Deployment_Card.png/revision/latest",
-    ["ichigo_hollow"] = "https://static.wikia.nocookie.net/animeadventures/images/4/45/Spirit_Reaper_%28Full_Hollow%29.png/revision/latest",
-    ["ichigo_mugetsu"] = "https://static.wikia.nocookie.net/animeadventures/images/3/36/Spirit_Reaper_%28Dusk%29.png/revision/latest",
-    ["ichigo_mugetsu_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/20/Spirit_Reaper_%28Final_Dusk%29.png/revision/latest",
-    ["illya"] = "https://static.wikia.nocookie.net/animeadventures/images/6/6c/Lilia.png/revision/latest",
-    ["illya_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/ce/Lilia_%28Homunculus%29.png/revision/latest",
-    ["inuyasha"] = "https://static.wikia.nocookie.net/animeadventures/images/4/47/Dog_Demon.png/revision/latest",
-    ["ippo"] = "https://static.wikia.nocookie.net/animeadventures/images/9/99/Boxer.png/revision/latest",
-    ["isagi"] = "https://static.wikia.nocookie.net/animeadventures/images/5/57/Messi.png/revision/latest",
-    ["issei"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4e/Dragon_Knight.png/revision/latest",
-    ["issei_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/5e/Dragon_Knight_%28Gauntlet%29.png/revision/latest",
-    ["itachi_2"] = "https://static.wikia.nocookie.net/animeadventures/images/a/ad/Izo_%28Black_Fire%29.png/revision/latest",
-    ["itachi_2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0a/Izo_%28Samurai%29.png/revision/latest",
-    ["itadori"] = "https://static.wikia.nocookie.net/animeadventures/images/c/cd/Itukoda.png/revision/latest",
-    ["izumi"] = "https://static.wikia.nocookie.net/animeadventures/images/0/02/Scarlet_Slayer.png/revision/latest",
-    ["izumi_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4d/Scarlet_Slayer_%28Cursed_Frost%29.png/revision/latest",
-    ["jellal"] = "https://static.wikia.nocookie.net/animeadventures/images/0/05/Jelly.png/revision/latest",
-    ["jellal_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/6a/Jelly_%28Heaven%29.png/revision/latest",
-    ["jin_mori"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b0/Wukong.png/revision/latest",
-    ["jiraiya"] = "https://static.wikia.nocookie.net/animeadventures/images/c/cd/Toad_Sensei.png/revision/latest",
-    ["jiraiya_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/17/Toad_Sensei_%28Toad_Sage%29.png/revision/latest",
-    ["jolyne"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0b/Dolphin.png/revision/latest",
-    ["jolyne_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2b/Dolphin_%28Determination%29.png/revision/latest",
-    ["josuke"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2b/Josuka_Deployment_Card.png/revision/latest",
-    ["josuke_2"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b2/Jose_%28Shining_Gem%29.png/revision/latest",
-    ["josuke_2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a0/Jose_%28Unbreakable%29.png/revision/latest",
-    ["jotaro_p6"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c9/Delinquent_%28Serious%29.png/revision/latest",
-    ["jotaro_p6_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/ef/Delinquent_%28The_Universe%29.png/revision/latest",
-    ["jozu"] = "https://static.wikia.nocookie.net/animeadventures/images/f/ff/Bozo.png/revision/latest",
-    ["judar"] = "https://static.wikia.nocookie.net/animeadventures/images/3/33/Dark_Mage.png/revision/latest",
-    ["judar_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/8/84/Dark_Mage_%28Fallen_Star%29.png/revision/latest",
-    ["julius"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b9/Time_Wizard.png/revision/latest",
-    ["julius_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e3/Time_Wizard_%28Chronos%29.png/revision/latest",
-    ["juuzou"] = "https://static.wikia.nocookie.net/animeadventures/images/3/38/Juozu.png/revision/latest",
-    ["juuzou_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a5/Juozu_%28Joker%29.png/revision/latest",
-    ["katakuri"] = "https://static.wikia.nocookie.net/animeadventures/images/4/45/Mochi.png/revision/latest",
-    ["katakuri_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1e/Mochi_%28Rage%29.png/revision/latest",
-    ["kenpachi"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d6/Packy.png/revision/latest",
-    ["kenpachi_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8a/Packy_%28Maniac%29.png/revision/latest",
-    ["kenshin"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e9/Katana.png/revision/latest",
-    ["kento"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b5/Ratio.png/revision/latest",
-    ["kento_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c3/Ratio_%28Overtime%29.png/revision/latest",
-    ["killua"] = "https://static.wikia.nocookie.net/animeadventures/images/2/22/Kizzua_Deployment_Card.png/revision/latest",
-    ["killua_godspeed"] = "https://static.wikia.nocookie.net/animeadventures/images/9/91/Killer_%28Whirlwind%29.png/revision/latest",
-    ["killua_godspeed_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/7d/Killer_%28Godspeed%29.png/revision/latest",
-    ["kimimaro"] = "https://static.wikia.nocookie.net/animeadventures/images/9/9c/Kimoaro.png/revision/latest",
-    ["king_7ds"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e5/Fairy_Ruler.png/revision/latest",
-    ["king_7ds_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/ee/Fairy_Ruler_%28Sloth%29.png/revision/latest",
-    ["kira"] = "https://static.wikia.nocookie.net/animeadventures/images/7/77/Calm_Killer.png/revision/latest",
-    ["kira_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/06/Calm_Killer_%28Meets_the_End%29.png/revision/latest",
-    ["kirito"] = "https://static.wikia.nocookie.net/animeadventures/images/0/06/Gamer.png/revision/latest",
-    ["kirito_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3c/Gamer_%28Dual%29.png/revision/latest",
-    ["kisame_unit"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1f/Sharkfin.png/revision/latest",
-    ["kisame_unit_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4e/Sharkfin_%28Tailless_Beast%29.png/revision/latest",
-    ["kisuke"] = "https://static.wikia.nocookie.net/animeadventures/images/b/bd/Trickster.png/revision/latest",
-    ["kisuke_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/9/90/Trickster_%28Release%29.png/revision/latest",
-    ["kite"] = "https://static.wikia.nocookie.net/animeadventures/images/5/57/Chance.png/revision/latest",
-    ["kite_evolved__placeholder"] = "https://static.wikia.nocookie.net/animeadventures/images/5/57/Chance.png/revision/latest",
-    ["kite_evolved_focus"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4a/Chance_%28Focus%29.png/revision/latest",
-    ["kite_evolved_frenzy"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e1/Chance_%28Frenzy%29.png/revision/latest",
-    ["kite_evolved_lethal"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2b/Chance_%28Lethal%29.png/revision/latest",
-    ["kite_evolved_precision"] = "https://static.wikia.nocookie.net/animeadventures/images/9/97/Chance_%28Precision%29.png/revision/latest",
-    ["klein"] = "https://static.wikia.nocookie.net/animeadventures/images/4/46/Virtual_Samurai.png/revision/latest",
-    ["klein_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c9/Virtual_Samurai_%28Bachelor%29.png/revision/latest",
-    ["kobeni"] = "https://static.wikia.nocookie.net/animeadventures/images/2/23/Cowardly.png/revision/latest",
-    ["kobeni_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/32/Cowardly_%28Scared%29.png/revision/latest",
-    ["koichi"] = "https://static.wikia.nocookie.net/animeadventures/images/e/ef/Reliable_Student.png/revision/latest",
-    ["koichi_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a8/Reliable_Student_%28Echoes%29.png/revision/latest",
-    ["konan_unit"] = "https://static.wikia.nocookie.net/animeadventures/images/5/50/Origami.png/revision/latest",
-    ["konan_unit_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/ed/Origami_%28Paper_Angel%29.png/revision/latest",
-    ["koneko"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0e/Catgirl.png/revision/latest",
-    ["koneko_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/24/Catgirl_%28Hell-Cat%29.png/revision/latest",
-    ["kuma_unit"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c7/Komo.png/revision/latest",
-    ["kyoko"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e4/Kyko.png/revision/latest",
-    ["kyoko_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/7e/Kyko_%28Crimson_Spear%29.png/revision/latest",
-    ["lancer"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d1/Spearer.png/revision/latest",
-    ["lancer_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/15/Spearer_%28Child_of_Light%29.png/revision/latest",
-    ["law_2"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0a/Operator_%28Heart%29.png/revision/latest",
-    ["law_2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/b/bf/Operator_%28ROOM%29.png/revision/latest",
-    ["leafa"] = "https://static.wikia.nocookie.net/animeadventures/images/0/00/Elfy.png/revision/latest",
-    ["leafa_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/66/Elfy_%28Sylph%29.png/revision/latest",
-    ["lelouch"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1f/Lulu.png/revision/latest",
-    ["lelouch_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e9/Lulu_%28Emperor%29.png/revision/latest",
-    ["levi"] = "https://static.wikia.nocookie.net/animeadventures/images/6/6f/Lex.png/revision/latest",
-    ["levi_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a7/Lex_Akoman.png/revision/latest",
-    ["luck"] = "https://static.wikia.nocookie.net/animeadventures/images/a/af/Karma.png/revision/latest",
-    ["luck_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/8/87/Karma_%28Thunder_Fiend%29.png/revision/latest",
-    ["lucy"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4c/Lyla.png/revision/latest",
-    ["lucy_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/01/Lyla_%28Celestial%29.png/revision/latest",
-    ["luffy_g4"] = "https://static.wikia.nocookie.net/animeadventures/images/2/25/Joykid_%28Bounce%29.png/revision/latest",
-    ["luffy_g4_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/04/Joykid_%28Mode_IV%29.png/revision/latest",
-    ["luffy_nightmare"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1b/Nightmare_Joykid.png/revision/latest",
-    ["madara"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8b/Mazara.png/revision/latest",
-    ["madara_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/b/ba/Mazara_%28Founder%29.png/revision/latest",
-    ["madoka"] = "https://static.wikia.nocookie.net/animeadventures/images/1/10/Magic_Girl.png/revision/latest",
-    ["madoka_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/10/Magic_Girl.png/revision/latest",
-    ["mahoraga"] = "https://static.wikia.nocookie.net/animeadventures/images/d/dd/Unknown.png/revision/latest",
-    ["mami"] = "https://static.wikia.nocookie.net/animeadventures/images/0/04/Millie.png/revision/latest",
-    ["mami_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/68/Millie_%28Holy%29.png/revision/latest",
-    ["mash"] = "https://static.wikia.nocookie.net/animeadventures/images/6/60/Bodybuilder.png/revision/latest",
-    ["mash_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2e/Bodybuilder_%28Muscles%29.png/revision/latest",
-    ["mechamaru"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f8/Robot_Sorceror.png/revision/latest",
-    ["medea"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2c/Hex.png/revision/latest",
-    ["medea_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/52/Hex_%28Witch_of_Betrayal%29.png/revision/latest",
-    ["megumi"] = "https://static.wikia.nocookie.net/animeadventures/images/5/53/Shadow_Sorcerer.png/revision/latest",
-    ["megumi2"] = "https://static.wikia.nocookie.net/animeadventures/images/6/63/Shadow_Sorcerer_%28Incident%29.png/revision/latest",
-    ["megumi2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/30/Shadow_Sorcerer_%28Ritual%29.png/revision/latest",
-    ["megumi_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/79/Shadow_Sorcerer_%28Hybrid_Shadow%29.png/revision/latest",
-    ["meliodas"] = "https://static.wikia.nocookie.net/animeadventures/images/d/de/Wratho.png/revision/latest",
-    ["meliodas_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1b/Wratho_%28Assault%29.png/revision/latest",
-    ["merlin"] = "https://static.wikia.nocookie.net/animeadventures/images/b/bf/Infinity_Mage.png/revision/latest",
-    ["merlin_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1f/Infinity_Mage_%28Endless%29.png/revision/latest",
-    ["meruem"] = "https://static.wikia.nocookie.net/animeadventures/images/5/56/Ant.png/revision/latest",
-    ["meruem_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/19/King_Ant.png/revision/latest",
-    ["metal_knight"] = "https://static.wikia.nocookie.net/animeadventures/images/4/45/Iron_Knight.png/revision/latest",
-    ["metal_knight_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/34/Iron_Knight_%28Arsenal%29.png/revision/latest",
-    ["minato"] = "https://static.wikia.nocookie.net/animeadventures/images/6/61/Flash_Ninja.png/revision/latest",
-    ["mirko"] = "https://static.wikia.nocookie.net/animeadventures/images/3/36/Lunar_Hare.png/revision/latest",
-    ["mirko_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/7e/Lunar_Hare_%28Tiger%29.png/revision/latest",
-    ["monet"] = "https://static.wikia.nocookie.net/animeadventures/images/0/0a/Siren.png/revision/latest",
-    ["monet_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/7d/Siren_%28Harpy%29.png/revision/latest",
-    ["moria"] = "https://static.wikia.nocookie.net/animeadventures/images/6/6b/Morbid.png/revision/latest",
-    ["moria_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a7/Morbid_%28Shadow_Lord%29.png/revision/latest",
-    ["nagumo"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2f/Switchblade.png/revision/latest",
-    ["nagumo_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/51/Switchblade_%28Deception%29.png/revision/latest",
-    ["nami"] = "https://static.wikia.nocookie.net/animeadventures/images/5/5d/Weather_Girl.png/revision/latest",
-    ["nami_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/34/Weather_Girl_%28Thief%29.png/revision/latest",
-    ["narberal"] = "https://static.wikia.nocookie.net/animeadventures/images/7/7a/Thunder_Maid.png/revision/latest",
-    ["narberal_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c3/Thunder_Maid_%28Servant%29.png/revision/latest",
-    ["naruto_6tails"] = "https://static.wikia.nocookie.net/animeadventures/images/d/df/Fox_Ninja_%28Six_Tails%29.png/revision/latest",
-    ["naruto_pts_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f7/Fox_Ninja_%28Beast_Cloak%29.png/revision/latest",
-    ["naruto_sage"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a8/Fox_Ninja_%28Sage%29.png/revision/latest",
-    ["natsu"] = "https://static.wikia.nocookie.net/animeadventures/images/6/64/Dragonslayer.png/revision/latest",
-    ["natsu_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/32/Dragonslayer_%28Lightning_Mode%29.png/revision/latest",
-    ["nejire"] = "https://static.wikia.nocookie.net/animeadventures/images/6/6e/Windspire.png/revision/latest",
-    ["netero"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d4/Prayer_Master.png/revision/latest",
-    ["netero_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/5e/Chairman_Prayer_Master.png/revision/latest",
-    ["noelle"] = "https://static.wikia.nocookie.net/animeadventures/images/8/87/Aquatic_Mage.png/revision/latest",
-    ["noelle_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/02/Aquatic_Mage_%28Valkyrie_Armor%29.png/revision/latest",
-    ["nokotan"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b8/Deer-tan.png/revision/latest",
-    ["obito"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e4/Toby.png/revision/latest",
-    ["osaka"] = "https://static.wikia.nocookie.net/animeadventures/images/a/ad/Kansai.png/revision/latest",
-    ["osaka_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/4/41/Kansai_%28Daydream%29.png/revision/latest",
-    ["osaragi"] = "https://static.wikia.nocookie.net/animeadventures/images/8/88/Somber.png/revision/latest",
-    ["osaragi_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/76/Somber_%28Buzzsaw%29.png/revision/latest",
-    ["overhaul"] = "https://static.wikia.nocookie.net/animeadventures/images/b/bf/Restructure.png/revision/latest",
-    ["pain_2"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3f/Agony_%28Path%29.png/revision/latest",
-    ["pain_2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c3/Agony_%28Divine%29.png/revision/latest",
-    ["perona"] = "https://static.wikia.nocookie.net/animeadventures/images/1/15/Ghost_Lady.png/revision/latest",
-    ["perona_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/25/Ghost_Lady_%28Princess%29.png/revision/latest",
-    ["piccolo_fused"] = "https://static.wikia.nocookie.net/animeadventures/images/a/ad/Green_Alien_%28Fusion%29.png/revision/latest",
-    ["piccolo_fused_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/7/72/Green_Alien_%28Nameless%29.png/revision/latest",
-    ["pitou"] = "https://static.wikia.nocookie.net/animeadventures/images/6/63/Cat_Guard.png/revision/latest",
-    ["pitou_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8c/Cat_Guard_%28Ballet%29.png/revision/latest",
-    ["poseidon"] = "https://static.wikia.nocookie.net/animeadventures/images/1/14/Sea_God.png/revision/latest",
-    ["poseidon_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/07/Sea_God_%28Tyrant_of_the_Seas%29.png/revision/latest",
-    ["power"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b5/Blood.png/revision/latest",
-    ["power_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/55/Blood_%28Unleashed%29.png/revision/latest",
-    ["pucci"] = "https://static.wikia.nocookie.net/animeadventures/images/1/14/Priest.png/revision/latest",
-    ["pucci_cmoon"] = "https://static.wikia.nocookie.net/animeadventures/images/2/27/Priest_%28New_Moon%29.png/revision/latest",
-    ["pucci_heaven"] = "https://static.wikia.nocookie.net/animeadventures/images/9/98/Priest_%28Heaven%29.png/revision/latest",
-    ["ragna"] = "https://static.wikia.nocookie.net/animeadventures/images/0/09/Silver_Slayer.png/revision/latest",
-    ["ragna_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8f/Silver_Slayer_%28Hunter%29.png/revision/latest",
-    ["rayleigh"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8a/Silver_King.png/revision/latest",
-    ["rengoku"] = "https://static.wikia.nocookie.net/animeadventures/images/9/9b/Donut.png/revision/latest",
-    ["rengoku_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/65/Donut_%28ABLAZE%29.png/revision/latest",
-    ["renji"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3d/Renzi.png/revision/latest",
-    ["rias"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2b/Riony.png/revision/latest",
-    ["rias_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/52/Riony_%28Devil_Princess%29.png/revision/latest",
-    ["rikka"] = "https://static.wikia.nocookie.net/animeadventures/images/c/ce/Chuuni.png/revision/latest",
-    ["rikka_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a8/Chuuni_%28Delusion%29.png/revision/latest",
-    ["rin_oku"] = "https://static.wikia.nocookie.net/animeadventures/images/6/63/Blue_Devil.png/revision/latest",
-    ["roger"] = "https://static.wikia.nocookie.net/animeadventures/images/2/28/Pirate_King.png/revision/latest",
-    ["roger_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/9/9e/Pirate_King_%28Final%29.png/revision/latest",
-    ["rohan"] = "https://static.wikia.nocookie.net/animeadventures/images/5/54/Mangaka.png/revision/latest",
-    ["rohan_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/6/65/Mangaka_%28Artist%29.png/revision/latest",
-    ["roshi"] = "https://static.wikia.nocookie.net/animeadventures/images/c/cc/Turtle_Master.png/revision/latest",
-    ["rukia_bankai"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b0/Snow_Reaper_%28War%29.png/revision/latest",
-    ["rukia_bankai_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/8/80/Snow_Reaper_%28Final%29.png/revision/latest",
-    ["saber"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a2/Sword_Queen.png/revision/latest",
-    ["saber_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/ca/Sword_Queen_%28Knight%29.png/revision/latest",
-    ["sabo"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e3/Rebel.png/revision/latest",
-    ["sabo_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/8/85/Rebel_%28Flame_Ruler%29.png/revision/latest",
-    ["saiki"] = "https://static.wikia.nocookie.net/animeadventures/images/e/eb/Saickik.png/revision/latest",
-    ["sakamoto"] = "https://static.wikia.nocookie.net/animeadventures/images/2/20/Legendary_Assassin.png/revision/latest",
-    ["sakamoto_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/17/Legendary_Assassin_%28Prime%29.png/revision/latest",
-    ["sasuke"] = "https://static.wikia.nocookie.net/animeadventures/images/f/fd/Sosuke_Deployment_Card.png/revision/latest",
-    ["sasuke_2"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d0/Shinobi_%28Hood%29.png/revision/latest",
-    ["sasuke_2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/15/Shinobi_%28Storm%29.png/revision/latest",
-    ["sasuke_3"] = "https://static.wikia.nocookie.net/animeadventures/images/7/75/Shinobi_%28Awakened%29.png/revision/latest",
-    ["sasuke_3_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/33/Shinobi_%28Eternal%29.png/revision/latest",
-    ["sato"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a2/Demihuman.png/revision/latest",
-    ["sato_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e8/Demihuman_%28Gamer%29.png/revision/latest",
-    ["sayaka"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d0/Saki.png/revision/latest",
-    ["sayaka_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/b/bd/Saki_%28Cyanblade%29.png/revision/latest",
-    ["sengoku_unit"] = "https://static.wikia.nocookie.net/animeadventures/images/9/9a/Golden_Navy.png/revision/latest",
-    ["sengoku_unit_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/9/92/Golden_Navy_%28Buddha%29.png/revision/latest",
-    ["shalltear"] = "https://static.wikia.nocookie.net/animeadventures/images/e/ed/Bloodcry.png/revision/latest",
-    ["shalltear_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3d/Bloodcry_%28Fallen%29.png/revision/latest",
-    ["shanks"] = "https://static.wikia.nocookie.net/animeadventures/images/8/88/Red_Scar.png/revision/latest",
-    ["shanks_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2d/Red_Scar_%28Conqueror%29.png/revision/latest",
-    ["shidou"] = "https://static.wikia.nocookie.net/animeadventures/images/e/ef/Joker.png/revision/latest",
-    ["shigaraki"] = "https://static.wikia.nocookie.net/animeadventures/images/1/11/Ashborn.png/revision/latest",
-    ["shigaraki_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/f/ff/Ashborn_%28Decay%29.png/revision/latest",
-    ["shisui"] = "https://static.wikia.nocookie.net/animeadventures/images/9/9d/Shizo.png/revision/latest",
-    ["shisui_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/33/Shizo_%28Flicker%29.png/revision/latest",
-    ["skull_knight"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a8/Skeleton_Knight.png/revision/latest",
-    ["skull_knight_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/9/91/Skeleton_Knight_%28King%29.png/revision/latest",
-    ["smoker_unit"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d9/Smoka.png/revision/latest",
-    ["smoker_unit_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/8/8d/Smoka_%28Hunter%29.png/revision/latest",
-    ["soifon"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f8/Wasp.png/revision/latest",
-    ["soifon_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c4/Wasp_%28Hornet%29.png/revision/latest",
-    ["sonic"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e0/Supersound.png/revision/latest",
-    ["sonic_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d2/Supersound_%28Speed%29.png/revision/latest",
-    ["speedwagon"] = "https://static.wikia.nocookie.net/animeadventures/images/d/df/C.E.O..png/revision/latest",
-    ["stain"] = "https://static.wikia.nocookie.net/animeadventures/images/2/23/Menace.png/revision/latest",
-    ["stain_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/35/Menace_%28Terror%29.png/revision/latest",
-    ["starlia"] = "https://static.wikia.nocookie.net/animeadventures/images/a/af/Psychic_Princess.png/revision/latest",
-    ["starlia_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/af/Psychic_Princess.png/revision/latest",
-    ["starrk"] = "https://static.wikia.nocookie.net/animeadventures/images/7/70/Jackal.png/revision/latest",
-    ["starrk_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c4/Jackal_%28Alpha%29.png/revision/latest",
-    ["sukuna"] = "https://static.wikia.nocookie.net/animeadventures/images/b/be/Cursed_King.png/revision/latest",
-    ["tanjiro"] = "https://static.wikia.nocookie.net/animeadventures/images/0/05/Tanji_Deployment_Card.png/revision/latest",
-    ["tatara"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1a/Tarata.png/revision/latest",
-    ["tatara_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/38/Tarata_%28Ignite%29.png/revision/latest",
-    ["tatsumaki"] = "https://static.wikia.nocookie.net/animeadventures/images/7/73/Tamiki.png/revision/latest",
-    ["tatsumaki_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/aa/Tamiki_%28Tornado%29.png/revision/latest",
-    ["tatsumi"] = "https://static.wikia.nocookie.net/animeadventures/images/a/aa/Tattermo.png/revision/latest",
-    ["temari"] = "https://static.wikia.nocookie.net/animeadventures/images/8/80/Fan_Ninja.png/revision/latest",
-    ["tengen"] = "https://static.wikia.nocookie.net/animeadventures/images/9/91/Tango.png/revision/latest",
-    ["tengen_2"] = "https://static.wikia.nocookie.net/animeadventures/images/d/dc/Tango_%28Score%29.png/revision/latest",
-    ["tengen_2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/ce/Tango_%28Flash_God%29.png/revision/latest",
-    ["thor"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4c/Lightning_God.png/revision/latest",
-    ["thor_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4c/Lightning_God.png/revision/latest",
-    ["todoroki"] = "https://static.wikia.nocookie.net/animeadventures/images/d/dd/Blaze_Frost.png/revision/latest",
-    ["todoroki_2"] = "https://static.wikia.nocookie.net/animeadventures/images/d/dd/Blaze_Frost.png/revision/latest",
-    ["todoroki_2_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/4/40/Blaze_Frost_%28Released%29.png/revision/latest",
-    ["toji"] = "https://static.wikia.nocookie.net/animeadventures/images/8/87/Sorcerer_Killer.png/revision/latest",
-    ["toji_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/17/Sorcerer_Killer_%28Heavenly_Body%29.png/revision/latest",
-    ["toshiro"] = "https://static.wikia.nocookie.net/animeadventures/images/1/16/Icy_Dragon.png/revision/latest",
-    ["toshiro_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/9/91/Icy_Dragon_%28Lotus%29.png/revision/latest",
-    ["trunks_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/d/dd/Unknown.png/revision/latest",
-    ["tsuna"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b5/Takamu.png/revision/latest",
-    ["tsuna_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a0/Takamu_%28Reborn%29.png/revision/latest",
-    ["ulquiorra"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a9/Void_Spear.png/revision/latest",
-    ["ulquiorra_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a9/Void_Spear.png/revision/latest",
-    ["unohana"] = "https://static.wikia.nocookie.net/animeadventures/images/b/b2/Bleed_Queen.png/revision/latest",
-    ["uraraka"] = "https://static.wikia.nocookie.net/animeadventures/images/8/88/Gravity_Hero.png/revision/latest",
-    ["uryu"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a2/Spirit_Archer.png/revision/latest",
-    ["uryu_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/d/dd/Spirit_Archer_%28Reversal%29.png/revision/latest",
-    ["usopp_ts"] = "https://static.wikia.nocookie.net/animeadventures/images/1/1e/Captain_%28Timeskip%29.png/revision/latest",
-    ["usopp_ts_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/4/4a/Captain_%28God%29.png/revision/latest",
-    ["vanilla_ice"] = "https://static.wikia.nocookie.net/animeadventures/images/8/83/Cream.png/revision/latest",
-    ["vanilla_ice_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/10/Cream_%28Void%29.png/revision/latest",
-    ["vash"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c2/Gunslinger.png/revision/latest",
-    ["vash_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/3/36/Vash_cross.png/revision/latest",
-    ["vegeta_majin"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c6/Vego_%28Mage%29.png/revision/latest",
-    ["vegeta_majin_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/1/10/Vego_%28Mage_II%29.png/revision/latest",
-    ["vegeta_super"] = "https://static.wikia.nocookie.net/animeadventures/images/2/2a/Vego_%28Super%29.png/revision/latest",
-    ["vegeta_super_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/f/fb/Vego_%28Super_II%29_%28Pose%29.png/revision/latest",
-    ["vegito"] = "https://static.wikia.nocookie.net/animeadventures/images/5/5c/Fused_Hero_%28Pose%29.png/revision/latest",
-    ["wendy"] = "https://static.wikia.nocookie.net/animeadventures/images/a/a1/Wind_Dragon_%28Pose%29.png/revision/latest",
-    ["whitebeard"] = "https://static.wikia.nocookie.net/animeadventures/images/a/ab/Whitehair.png/revision/latest",
-    ["whitebeard_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e7/Emperor_Whitehair.png/revision/latest",
-    ["yamamoto"] = "https://static.wikia.nocookie.net/animeadventures/images/f/f0/Fiery_Commander.png/revision/latest",
-    ["yamamoto_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/e/e9/Fiery_Commander_%28Hellfire%29.png/revision/latest",
-    ["yami"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d8/Black_Blade.png/revision/latest",
-    ["yami_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/d/d8/Black_Blade.png/revision/latest",
-    ["yoshino"] = "https://static.wikia.nocookie.net/animeadventures/images/5/5a/Puppet_Girl.png/revision/latest",
-    ["yoshino_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/0/06/Puppet_Girl_%28Spirit%29.png/revision/latest",
-    ["yuma"] = "https://static.wikia.nocookie.net/animeadventures/images/9/91/Shrimp.png/revision/latest",
-    ["yuma_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/9/91/Shrimp.png/revision/latest",
-    ["yuno"] = "https://static.wikia.nocookie.net/animeadventures/images/6/6d/Elf_Spirit.png/revision/latest",
-    ["yuno_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/5/53/Elf_Spirit_%28Wind%29.png/revision/latest",
-    ["yuta"] = "https://static.wikia.nocookie.net/animeadventures/images/5/52/Mimic_Sorcerer.png/revision/latest",
-    ["yuta_evolved"] = "https://static.wikia.nocookie.net/animeadventures/images/c/c3/Mimic_Sorcerer_%28Cursed_Child%29.png/revision/latest",
-    ["zabuza"] = "https://static.wikia.nocookie.net/animeadventures/images/3/3b/Mist_Ninja.png/revision/latest",
-    ["zoro"] = "https://static.wikia.nocookie.net/animeadventures/images/d/dd/Zoru_Deployment_Card.png/revision/latest",
+    ["ace"] = "a/ad/Fire_Fist.png",
+    ["ainz"] = "d/d1/Supreme_Being.png",
+    ["ainz_evolved"] = "2/26/Supreme_Being_%28Sovereign%29.png",
+    ["aizen"] = "a/af/Illusionist.png",
+    ["aizen_christmas"] = "f/fa/Illusionist_%28Transcended%29.png",
+    ["aizen_chrys"] = "1/18/Illusionist_%28Chrysalis%29.png",
+    ["aizen_evolved"] = "c/c5/Illusionist_%28Betrayal%29.png",
+    ["aizen_hog"] = "2/25/Illusionist_%28Fusion%29.png",
+    ["aizen_hog_evolved"] = "b/b7/Illusionist_%28Final%29.png",
+    ["akainu"] = "f/f9/Magma.png",
+    ["akainu_evolved"] = "6/6f/Fleet_Admiral_Magma.png",
+    ["akaza_unit"] = "3/3e/Martial_Demon.png",
+    ["akaza_unit_evolved"] = "7/7a/Martial_Demon_%28Destruction%29.png",
+    ["akeno"] = "b/ba/Akemy.png",
+    ["akeno_evolved"] = "7/71/Akemy_%28Fallen_Angel%29.png",
+    ["aki"] = "8/85/Curse.png",
+    ["aki_evolved"] = "f/fc/Curse_%28Contract%29.png",
+    ["akutagawa"] = "c/cd/Black_Dog.png",
+    ["akutagawa_evolved"] = "5/58/Black_Dog_%28HellHound%29.png",
+    ["albedo"] = "4/4f/Cherub.png",
+    ["albedo_evolved"] = "f/f0/Cherub_%28Overseer%29.png",
+    ["all_might"] = "a/a4/Prime_Force.png",
+    ["all_might_evolved"] = "b/b4/Prime_Force_%28Peace%29.png",
+    ["alucard"] = "8/8f/Dracula.png",
+    ["alucard_evolved"] = "8/8f/Dracula.png",
+    ["amon"] = "e/ee/Amon.webp",
+    ["android21"] = "0/06/Android_AAA.png",
+    ["angel_devil"] = "1/1e/Paragon.png",
+    ["angel_devil_evolved"] = "3/31/Paragon_%28Devil%29.png",
+    ["aokiji"] = "5/58/Frost_Navy.png",
+    ["aokiji_evolved"] = "1/15/Frost_Navy_%28Blue_Pigeon%29.png",
+    ["archer"] = "7/78/Faker.png",
+    ["archer_evolved"] = "5/51/Faker_%28Hero%27s_Soul%29.png",
+    ["arima"] = "1/1f/Ariva.png",
+    ["arima_evolved"] = "c/c5/Ariva_%28Reaper%29.png",
+    ["armin"] = "d/d1/Arlem.png",
+    ["asta"] = "1/1f/Magic_Disbeliever.png",
+    ["asta_evolved"] = "9/93/Magic_Disbeliever_%28Dark%29.png",
+    ["asuna"] = "3/3f/Gamer_Girl.png",
+    ["asuna_evolved"] = "b/b1/Gamer_Girl_%28Flash%29.png",
+    ["atsushi"] = "a/ae/Tiger.png",
+    ["atsushi_evolved"] = "d/d3/Tiger_%28Moonlight_Beast%29.png",
+    ["avdol"] = "6/66/Flamefeather.png",
+    ["avdol_evolved"] = "6/61/Flamefeather_%28Arcane_Blaze%29.png",
+    ["bakugou"] = "8/8f/Explosion_Hero.png",
+    ["bakugou_2"] = "e/e4/Explosion_Hero_%28Bang%29.png",
+    ["bakugou_2_evolved"] = "7/70/Explosion_Hero_%28Impact%29.png",
+    ["bambietta"] = "c/c9/Bombietta.png",
+    ["ban"] = "1/10/Crimson_Thief.png",
+    ["ban_evolved"] = "a/ac/Crimson_Thief_%28Hunt%29.png",
+    ["bang"] = "c/cb/Waterfist.png",
+    ["bang_evolved"] = "c/c0/Waterfist_%28White_Tooth%29.png",
+    ["bee_girl"] = "c/c6/Honey.png",
+    ["bee_girl_evolved"] = "c/cb/Honey_%28Hive%29.png",
+    ["blackbeard"] = "0/0a/Blackhair.png",
+    ["boa"] = "0/0a/Snake_Princess.png",
+    ["boros"] = "0/0a/Alien_King.png",
+    ["boros_evolved"] = "1/1b/Lord_Alien_King.png",
+    ["boxxo"] = "a/a6/Dispenser.png",
+    ["broly"] = "5/5c/Bro.png",
+    ["broly_evolved"] = "d/db/Super_Bro.png",
+    ["brook"] = "2/23/Skeleton.png",
+    ["brook_evolved"] = "2/2d/Skeleton_%28Soul_King%29.png",
+    ["buddha"] = "f/fd/Enlightened.png",
+    ["buddha_evolved"] = "3/36/Enlightened_%28Nirvana%29.png",
+    ["buggy"] = "4/4d/Stitches.png",
+    ["bulma"] = "e/e3/Bulby.png",
+    ["buu"] = "0/02/Bubblegum.png",
+    ["buu_evolved"] = "3/3d/Bubblegum_%28Ultimate%29.png",
+    ["byakuya"] = "9/91/Icy_Dragon_%28Lotus%29.png",
+    ["caesar"] = "3/33/Julias.png",
+    ["caesarclown"] = "7/78/Gas.png",
+    ["caesarclown_evolved"] = "c/c0/Gas_%28Toxic%29.png",
+    ["carrot"] = "8/82/Bunny.png",
+    ["carrot_evolved"] = "7/73/Bunny_%28Night%29.png",
+    ["cell_imperfect"] = "7/7e/Experiment_X_%28Imperfect%29.png",
+    ["cell_perfect"] = "8/8b/Experiment_X_%28Perfect%29.png",
+    ["cell_semi_perfect"] = "b/bf/Experiment_X_%28Semi-Perfect%29.png",
+    ["cell_super_perfect"] = "5/58/Experiment_X_%28SUPER_PERFECT%29.png",
+    ["chad"] = "f/fa/Brawler.png",
+    ["chad_evolved"] = "0/01/Brawler_%28Soul%29.png",
+    ["charmy"] = "c/c3/Cotton.png",
+    ["charmy_evolved"] = "4/4f/Cotton_%28Sheep%29.png",
+    ["chihiro"] = "3/3b/Vengeful_Swordsman.png",
+    ["chihiro_evolved"] = "5/55/Vengeful_Swordsman_%28Sky_Reaver%29.png",
+    ["chika"] = "9/92/Spirit_Sniper.png",
+    ["chika_evolved"] = "0/05/Spirit_Sniper_%28Prodigy%29.png",
+    ["chuya"] = "6/6d/Gravity_Mage.png",
+    ["chuya_evolved"] = "0/0c/Gravity_Mage_%28Void%29.png",
+    ["cid"] = "a/a2/Umbra.png",
+    ["cid_evolved"] = "2/2e/Umbra_%28Nuclear%29.png",
+    ["conrad"] = "4/44/Connor.png",
+    ["conrad_evolved"] = "4/44/Connor_%28Wizard_King%29.png",
+    ["cooler"] = "6/66/Fridge.png",
+    ["cranel"] = "0/0c/Player.png",
+    ["cranel_evolved"] = "d/d6/Player_%28Argus%29.png",
+    ["dabi"] = "0/06/Scorch.png",
+    ["daki"] = "9/96/Saka.png",
+    ["daki_evolved"] = "3/39/Saka_%28Ribbon%29.png",
+    ["dazai"] = "9/9a/InHuman.png",
+    ["dazai_evolved"] = "4/4b/InHuman_%28Nullifier%29.png",
+    ["deku"] = "3/3a/Verdant_Hero.png",
+    ["deku_vigilante"] = "a/a7/Verdant_Hero_%28String%29.png",
+    ["deku_vigilante_evolved"] = "7/73/Verdant_Hero_%28Dark%29.png",
+    ["demiurge"] = "f/f1/Lucifer.png",
+    ["demiurge_evolved"] = "0/0b/Lucifer_%28Demon_Emperor%29.png",
+    ["denji"] = "0/03/Blade_Beast.png",
+    ["denji_evolved"] = "3/3d/Blade_Beast_%28Hybrid%29.png",
+    ["denji_secret"] = "3/38/Blade_Beast_%28Past%29.png",
+    ["diane"] = "0/0e/Hammer_Giantess.png",
+    ["diane_evolved"] = "1/19/Hammer_Giantess_%28Creation%29.png",
+    ["diavolo"] = "e/e8/Devil_Boss.png",
+    ["dio"] = "d/d4/JIO_%28Over_Heaven%29.png",
+    ["dio_heaven"] = "d/d4/JIO_%28Over_Heaven%29.png",
+    ["doflamingo"] = "e/ef/Stringy.png",
+    ["doflamingo_evolved"] = "e/e8/Stringy_%28Awakened%29.png",
+    ["dokuro"] = "a/a6/Violentine.png",
+    ["dokuro_evolved"] = "7/74/Violentine_%28Brutal_Angel%29.png",
+    ["dominico"] = "d/df/Weather.png",
+    ["dominico_evolved"] = "6/67/Heavy_Weather.png",
+    ["elyssia"] = "d/d4/Elyssia.png",
+    ["elyssia_eel"] = "d/d4/Elyssia.png",
+    ["elyssia_evolved"] = "c/cb/Elyssia_%28Abyssal%29.png",
+    ["emilia"] = "4/45/Ice_Lily.png",
+    ["endeavor"] = "9/94/Flame_Hero.png",
+    ["endeavor_evolved"] = "3/3d/Flame_Hero_%28Hellfire%29.png",
+    ["eren"] = "f/f9/Usurper_%28Founder%29.png",
+    ["eren_final"] = "f/f9/Usurper_%28Founder%29.png",
+    ["ermes"] = "9/9d/Hermy.png",
+    ["ermes_evolved"] = "2/20/Hermy_%28Duplicate%29.png",
+    ["erwin"] = "2/2e/Commander.png",
+    ["erza"] = "c/c9/Elize.png",
+    ["erza_evolved__placeholder"] = "c/c9/Elize.png",
+    ["erza_lightning"] = "c/c9/Elize.png",
+    ["erza_samurai"] = "4/46/Elize_%28True_Heart%29.png",
+    ["erza_valkyrie"] = "3/34/Elize_%28Valkyrie%29.png",
+    ["escanor"] = "6/66/Hubris_%28The_One%29.png",
+    ["escanor_evolved"] = "6/66/Hubris_%28The_One%29.png",
+    ["escanor_weak"] = "c/ce/Hubris_%28Night%29.png",
+    ["esdeath"] = "9/9f/Ice_Queen.png",
+    ["esdeath_evolved"] = "7/7e/Ice_Queen_%28Empire%27s_Strongest%29.png",
+    ["eto"] = "b/b3/Eta.png",
+    ["eto_evolved"] = "b/b8/Eta_%28One-Eye%29.png",
+    ["evileye"] = "4/42/Crystal_Rose.png",
+    ["evileye_evolved"] = "c/cb/Crystal_Rose_%28Impact%29.png",
+    ["feitan"] = "8/84/Spider.png",
+    ["feitan_evolved"] = "d/d3/Spider_%28Immolation%29.png",
+    ["femto"] = "2/2a/Griffin_%28Darkness%29.png",
+    ["femto_egg"] = "a/a5/Griffin_%28Ascension%29.png",
+    ["frieren"] = "5/5b/Elf_Mage.png",
+    ["frieren_evolved"] = "2/2d/Elf_Mage_%28Aura%29.png",
+    ["frieza"] = "4/4c/Golden_Tyrant.png",
+    ["frieza_golden"] = "4/4c/Golden_Tyrant.png",
+    ["frieza_golden_evolved"] = "e/ef/Golden_Tyrant_%28Emperor%29.png",
+    ["frieza_mecha"] = "4/4c/Golden_Tyrant.png",
+    ["fugo"] = "e/e8/Haze.png",
+    ["fugo_evolved"] = "1/1a/Haze_%28Rage%29.png",
+    ["fujitora"] = "8/8b/Gravity_Navy.png",
+    ["fujitora_evolved"] = "5/5f/Gravity_Navy_%28Admiral%29.png",
+    ["future_gohan"] = "b/b1/Future_Goh.png",
+    ["gaara"] = "e/e5/Boss_-_The_Scorpion_of_the_Red_Sand.png",
+    ["gabimaru"] = "8/87/Flower_Ninja.png",
+    ["gabimaru_evolved"] = "7/70/Flower_Ninja_%28Austere_Flame%29.png",
+    ["gaku"] = "3/33/Killstreak.png",
+    ["gaku_evolved"] = "2/2e/Killstreak_%28Speedrun%29.png",
+    ["genos"] = "e/ed/Cyborg_%28Overdrive%29.png",
+    ["genos_2"] = "e/ed/Cyborg_%28Overdrive%29.png",
+    ["genos_2_evolved"] = "6/65/Cyborg_%28Incinerate%29.png",
+    ["geten"] = "8/8b/Ice_Shaper.png",
+    ["geto"] = "0/04/Gazu.png",
+    ["geto_evolved"] = "4/4e/Gazu_%28Maximum%29.png",
+    ["ghiaccio"] = "3/39/Skater.png",
+    ["ghiaccio_evolved"] = "2/2f/Skater_%28Album%29.png",
+    ["ghostkun"] = "b/b0/Ghost-kun.png",
+    ["ghostkun_evolved"] = "8/88/Ghost-kun_%28Bound%29.png",
+    ["gildarts"] = "1/15/Crush.png",
+    ["gildarts_evolved"] = "b/b1/Crush_%28Ace%29.png",
+    ["gilgamesh"] = "5/53/Golden_King.png",
+    ["gilgamesh_evolved"] = "e/ec/Golden_King_%28Lord_of_Heroes%29.png",
+    ["gin"] = "e/e6/White_Snake.png",
+    ["gin_evolved"] = "3/35/White_Snake_%28Sacred_Spear%29.png",
+    ["giorno"] = "4/4f/Gold_Boy_%28Requiem%29.png",
+    ["giselle"] = "c/c3/Zombie.png",
+    ["giselle_evolved"] = "6/6d/Zombie_%28Risen%29.png",
+    ["gogeta_failed"] = "c/cf/%3F%3F%3F.png",
+    ["gogeta_failed__placeholder"] = "c/cf/%3F%3F%3F.png",
+    ["gojo"] = "b/b0/Paradox.png",
+    ["gojo_evolved"] = "3/3b/Paradox_%28Divine_Sight%29.png",
+    ["goku"] = "3/3d/Goko_Deployment_Card.png",
+    ["goku_black"] = "3/3d/Goko_Deployment_Card.png",
+    ["goku_ssb"] = "3/3d/Goko_Deployment_Card.png",
+    ["goku_ssj3"] = "0/0c/Carrot_%28Super_III%29.png",
+    ["goku_ssj3_evolved"] = "2/2d/Carrot_%28Ultra%29.png",
+    ["gon"] = "a/a5/Gene_%28Adult%29.png",
+    ["gon_adult"] = "a/a5/Gene_%28Adult%29.png",
+    ["gon_adult_evolved"] = "1/10/%3F%3F%3F_%28Pose%29.png",
+    ["gowther"] = "f/fb/Doll.png",
+    ["gowther_evolved"] = "0/02/Doll_%28Spirit_Archer%29.png",
+    ["gray"] = "c/c6/Cold_Mage.png",
+    ["gray_evolved"] = "a/ad/Cold_Mage_%28Devil_Slayer%29.png",
+    ["gremmy"] = "2/29/Dreamer.png",
+    ["gremmy_evolved"] = "c/c0/Dreamer_%28Visionary%29.png",
+    ["griffith"] = "f/f8/Griffin.png",
+    ["griffith_reincarnation"] = "5/51/Griffin_%28Reincarnation%29.png",
+    ["grimmjow"] = "4/41/Iceclaw_%28Rebirth%29.png",
+    ["grimmjow_res"] = "4/41/Iceclaw_%28Rebirth%29.png",
+    ["grimmjow_res_evolved"] = "3/3f/Iceclaw_%28Azure_Fang%29.png",
+    ["guts"] = "a/a8/Berserker.png",
+    ["guts_berserker"] = "7/77/Berserker_%28Rage%29.png",
+    ["gyutaro"] = "b/b1/Sepsis.png",
+    ["gyutaro_evolved"] = "6/63/Sepsis_%28Moon%29.png",
+    ["hakari"] = "8/8a/Gambler.png",
+    ["hakari_evolved"] = "3/32/Gambler_%28Jackpot%29.png",
+    ["haku"] = "c/c7/Mirror_Ninja.png",
+    ["haku_evolved"] = "5/55/Mirror_Ninja_%28Reflection%29.png",
+    ["hange"] = "4/4e/Eccentric_Researcher.png",
+    ["hange_evolved"] = "f/f3/Eccentric_Researcher_%28Captain%29.png",
+    ["harribel"] = "e/e1/Hammerhead.png",
+    ["harribel_evolved"] = "7/71/Hammerhead_%28Shark_Empress%29.png",
+    ["hawks"] = "0/06/Falcon.png",
+    ["hawks_evolved"] = "3/36/Falcon_%28Feather_Strike%29.png",
+    ["heathcliff"] = "e/eb/Crusader.png",
+    ["heathcliff_evolved"] = "9/9b/Crusader_%28Admin%29.png",
+    ["hei"] = "5/50/Black_Assassin.png",
+    ["hei_evolved"] = "9/9b/Black_Assassin_%28Reaper%29.png",
+    ["hidan_unit"] = "f/f5/Death_Ninja.png",
+    ["hidan_unit_evolved"] = "1/1f/Death_Ninja_%28Immortal_Butcher%29.png",
+    ["hiei"] = "f/fe/Demonshade.png",
+    ["himeno"] = "5/53/Ghosty.png",
+    ["himeno_evolved"] = "0/02/Ghosty_%28Sacrifice%29.png",
+    ["hinami"] = "9/95/Fiend_Girl.png",
+    ["hinami_evolved"] = "9/95/Fiend_Girl.png",
+    ["hisoka"] = "e/ef/Joker.png",
+    ["homura"] = "d/d9/Shadowgirl.png",
+    ["homura_evolved"] = "b/be/Shadowgirl_%28Time_Traveller%29_%28Pose%29.png",
+    ["hoshino"] = "0/07/Idol.png",
+    ["hoshino_2"] = "0/07/Idol.png",
+    ["hoshino_2_evolved"] = "6/65/Idol_%28Star%29.png",
+    ["hoshino_evolved"] = "6/65/Idol_%28Star%29.png",
+    ["ichigo"] = "b/b5/Ichi_Deployment_Card.png",
+    ["ichigo_hollow"] = "4/45/Spirit_Reaper_%28Full_Hollow%29.png",
+    ["ichigo_mask"] = "3/36/Shiny_Ichigo_Mask.webp",
+    ["ichigo_mugetsu"] = "3/36/Spirit_Reaper_%28Dusk%29.png",
+    ["ichigo_mugetsu_evolved"] = "2/20/Spirit_Reaper_%28Final_Dusk%29.png",
+    ["illya"] = "6/6c/Lilia.png",
+    ["illya_evolved"] = "c/ce/Lilia_%28Homunculus%29.png",
+    ["inosuke"] = "0/03/Blade_Beast.png",
+    ["inuyasha"] = "4/47/Dog_Demon.png",
+    ["ippo"] = "9/99/Boxer.png",
+    ["isagi"] = "5/57/Messi.png",
+    ["issei"] = "4/4e/Dragon_Knight.png",
+    ["issei_evolved"] = "5/5e/Dragon_Knight_%28Gauntlet%29.png",
+    ["itachi"] = "a/ad/Izo_%28Black_Fire%29.png",
+    ["itachi_2"] = "a/ad/Izo_%28Black_Fire%29.png",
+    ["itachi_2_evolved"] = "0/0a/Izo_%28Samurai%29.png",
+    ["itadori"] = "c/cd/Itukoda.png",
+    ["izumi"] = "0/02/Scarlet_Slayer.png",
+    ["izumi_evolved"] = "4/4d/Scarlet_Slayer_%28Cursed_Frost%29.png",
+    ["jellal"] = "0/05/Jelly.png",
+    ["jellal_evolved"] = "6/6a/Jelly_%28Heaven%29.png",
+    ["jin_mori"] = "b/b0/Wukong.png",
+    ["jiraiya"] = "c/cd/Toad_Sensei.png",
+    ["jiraiya_evolved"] = "1/17/Toad_Sensei_%28Toad_Sage%29.png",
+    ["jolyne"] = "0/0b/Dolphin.png",
+    ["jolyne_evolved"] = "2/2b/Dolphin_%28Determination%29.png",
+    ["jonathan"] = "5/53/Johna_Shiny.png",
+    ["josuke"] = "2/2b/Josuka_Deployment_Card.png",
+    ["josuke_2"] = "b/b2/Jose_%28Shining_Gem%29.png",
+    ["josuke_2_evolved"] = "a/a0/Jose_%28Unbreakable%29.png",
+    ["jotaro"] = "c/c9/Delinquent_%28Serious%29.png",
+    ["jotaro_p6"] = "c/c9/Delinquent_%28Serious%29.png",
+    ["jotaro_p6_evolved"] = "e/ef/Delinquent_%28The_Universe%29.png",
+    ["jozu"] = "f/ff/Bozo.png",
+    ["judar"] = "3/33/Dark_Mage.png",
+    ["judar_evolved"] = "8/84/Dark_Mage_%28Fallen_Star%29.png",
+    ["julius"] = "b/b9/Time_Wizard.png",
+    ["julius_evolved"] = "e/e3/Time_Wizard_%28Chronos%29.png",
+    ["juuzou"] = "3/38/Juozu.png",
+    ["juuzou_evolved"] = "a/a5/Juozu_%28Joker%29.png",
+    ["kaneki"] = "8/8e/Kaneki_Cover.webp",
+    ["kaneki_2"] = "8/8e/Kaneki_Cover.webp",
+    ["katakuri"] = "4/45/Mochi.png",
+    ["katakuri_evolved"] = "1/1e/Mochi_%28Rage%29.png",
+    ["kenpachi"] = "d/d6/Packy.png",
+    ["kenpachi_evolved"] = "8/8a/Packy_%28Maniac%29.png",
+    ["kenshin"] = "e/e9/Katana.png",
+    ["kento"] = "b/b5/Ratio.png",
+    ["kento_evolved"] = "c/c3/Ratio_%28Overtime%29.png",
+    ["killua"] = "2/22/Kizzua_Deployment_Card.png",
+    ["killua_godspeed"] = "9/91/Killer_%28Whirlwind%29.png",
+    ["killua_godspeed_evolved"] = "7/7d/Killer_%28Godspeed%29.png",
+    ["kimimaro"] = "9/9c/Kimoaro.png",
+    ["king_7ds"] = "e/e5/Fairy_Ruler.png",
+    ["king_7ds_evolved"] = "e/ee/Fairy_Ruler_%28Sloth%29.png",
+    ["kira"] = "7/77/Calm_Killer.png",
+    ["kira_evolved"] = "0/06/Calm_Killer_%28Meets_the_End%29.png",
+    ["kirito"] = "0/06/Gamer.png",
+    ["kirito_evolved"] = "3/3c/Gamer_%28Dual%29.png",
+    ["kisame_unit"] = "1/1f/Sharkfin.png",
+    ["kisame_unit_evolved"] = "4/4e/Sharkfin_%28Tailless_Beast%29.png",
+    ["kisuke"] = "b/bd/Trickster.png",
+    ["kisuke_evolved"] = "9/90/Trickster_%28Release%29.png",
+    ["kite"] = "5/57/Chance.png",
+    ["kite_evolved__placeholder"] = "5/57/Chance.png",
+    ["kite_evolved_focus"] = "4/4a/Chance_%28Focus%29.png",
+    ["kite_evolved_frenzy"] = "e/e1/Chance_%28Frenzy%29.png",
+    ["kite_evolved_lethal"] = "2/2b/Chance_%28Lethal%29.png",
+    ["kite_evolved_precision"] = "9/97/Chance_%28Precision%29.png",
+    ["klein"] = "4/46/Virtual_Samurai.png",
+    ["klein_evolved"] = "c/c9/Virtual_Samurai_%28Bachelor%29.png",
+    ["kobeni"] = "2/23/Cowardly.png",
+    ["kobeni_evolved"] = "3/32/Cowardly_%28Scared%29.png",
+    ["koichi"] = "e/ef/Reliable_Student.png",
+    ["koichi_evolved"] = "a/a8/Reliable_Student_%28Echoes%29.png",
+    ["konan_unit"] = "5/50/Origami.png",
+    ["konan_unit_evolved"] = "e/ed/Origami_%28Paper_Angel%29.png",
+    ["koneko"] = "0/0e/Catgirl.png",
+    ["koneko_evolved"] = "2/24/Catgirl_%28Hell-Cat%29.png",
+    ["krillin"] = "9/9f/Krillin_Cover.webp",
+    ["kuma_unit"] = "c/c7/Komo.png",
+    ["kyoko"] = "e/e4/Kyko.png",
+    ["kyoko_evolved"] = "7/7e/Kyko_%28Crimson_Spear%29.png",
+    ["lancer"] = "d/d1/Spearer.png",
+    ["lancer_evolved"] = "1/15/Spearer_%28Child_of_Light%29.png",
+    ["law"] = "0/0a/Operator_%28Heart%29.png",
+    ["law_2"] = "0/0a/Operator_%28Heart%29.png",
+    ["law_2_evolved"] = "b/bf/Operator_%28ROOM%29.png",
+    ["leafa"] = "0/00/Elfy.png",
+    ["leafa_evolved"] = "6/66/Elfy_%28Sylph%29.png",
+    ["lelouch"] = "1/1f/Lulu.png",
+    ["lelouch_evolved"] = "e/e9/Lulu_%28Emperor%29.png",
+    ["levi"] = "6/6f/Lex.png",
+    ["levi_evolved"] = "a/a7/Lex_Akoman.png",
+    ["luck"] = "a/af/Karma.png",
+    ["luck_evolved"] = "8/87/Karma_%28Thunder_Fiend%29.png",
+    ["lucy"] = "4/4c/Lyla.png",
+    ["lucy_evolved"] = "0/01/Lyla_%28Celestial%29.png",
+    ["luffy"] = "f/f4/Luffy_Cover.webp",
+    ["luffy_g4"] = "2/25/Joykid_%28Bounce%29.png",
+    ["luffy_g4_evolved"] = "0/04/Joykid_%28Mode_IV%29.png",
+    ["luffy_marineford"] = "f/f4/Luffy_Cover.webp",
+    ["luffy_nightmare"] = "1/1b/Nightmare_Joykid.png",
+    ["madara"] = "8/8b/Mazara.png",
+    ["madara_evolved"] = "b/ba/Mazara_%28Founder%29.png",
+    ["madoka"] = "1/10/Magic_Girl.png",
+    ["madoka_evolved"] = "1/10/Magic_Girl.png",
+    ["magna"] = "9/94/Flame_Hero.png",
+    ["mami"] = "0/04/Millie.png",
+    ["mami_evolved"] = "6/68/Millie_%28Holy%29.png",
+    ["mash"] = "6/60/Bodybuilder.png",
+    ["mash_evolved"] = "2/2e/Bodybuilder_%28Muscles%29.png",
+    ["mechamaru"] = "f/f8/Robot_Sorceror.png",
+    ["medea"] = "2/2c/Hex.png",
+    ["medea_evolved"] = "5/52/Hex_%28Witch_of_Betrayal%29.png",
+    ["megumi"] = "5/53/Shadow_Sorcerer.png",
+    ["megumi2"] = "6/63/Shadow_Sorcerer_%28Incident%29.png",
+    ["megumi2_evolved"] = "3/30/Shadow_Sorcerer_%28Ritual%29.png",
+    ["megumi_evolved"] = "7/79/Shadow_Sorcerer_%28Hybrid_Shadow%29.png",
+    ["meliodas"] = "d/de/Wratho.png",
+    ["meliodas_evolved"] = "1/1b/Wratho_%28Assault%29.png",
+    ["merlin"] = "b/bf/Infinity_Mage.png",
+    ["merlin_evolved"] = "1/1f/Infinity_Mage_%28Endless%29.png",
+    ["meruem"] = "5/56/Ant.png",
+    ["meruem_evolved"] = "1/19/King_Ant.png",
+    ["metal_knight"] = "4/45/Iron_Knight.png",
+    ["metal_knight_drone"] = "4/45/Iron_Knight.png",
+    ["metal_knight_evolved"] = "3/34/Iron_Knight_%28Arsenal%29.png",
+    ["minato"] = "6/61/Flash_Ninja.png",
+    ["mirko"] = "3/36/Lunar_Hare.png",
+    ["mirko_evolved"] = "7/7e/Lunar_Hare_%28Tiger%29.png",
+    ["monet"] = "0/0a/Siren.png",
+    ["monet_evolved"] = "7/7d/Siren_%28Harpy%29.png",
+    ["moria"] = "6/6b/Morbid.png",
+    ["moria_evolved"] = "a/a7/Morbid_%28Shadow_Lord%29.png",
+    ["nagumo"] = "2/2f/Switchblade.png",
+    ["nagumo_evolved"] = "5/51/Switchblade_%28Deception%29.png",
+    ["nami"] = "5/5d/Weather_Girl.png",
+    ["nami_evolved"] = "3/34/Weather_Girl_%28Thief%29.png",
+    ["narberal"] = "7/7a/Thunder_Maid.png",
+    ["narberal_evolved"] = "c/c3/Thunder_Maid_%28Servant%29.png",
+    ["naruto"] = "a/a6/Naruto_R.webp",
+    ["naruto_6tails"] = "d/df/Fox_Ninja_%28Six_Tails%29.png",
+    ["naruto_pts"] = "a/a6/Naruto_R.webp",
+    ["naruto_pts_evolved"] = "f/f7/Fox_Ninja_%28Beast_Cloak%29.png",
+    ["naruto_sage"] = "a/a8/Fox_Ninja_%28Sage%29.png",
+    ["natsu"] = "6/64/Dragonslayer.png",
+    ["natsu_evolved"] = "3/32/Dragonslayer_%28Lightning_Mode%29.png",
+    ["nejire"] = "6/6e/Windspire.png",
+    ["netero"] = "d/d4/Prayer_Master.png",
+    ["netero_evolved"] = "5/5e/Chairman_Prayer_Master.png",
+    ["nezuko"] = "5/57/Nezuko_Cover.webp",
+    ["nobara"] = "3/31/Nobaba0.png",
+    ["noelle"] = "8/87/Aquatic_Mage.png",
+    ["noelle_evolved"] = "0/02/Aquatic_Mage_%28Valkyrie_Armor%29.png",
+    ["nokotan"] = "b/b8/Deer-tan.png",
+    ["obito"] = "e/e4/Toby.png",
+    ["osaka"] = "a/ad/Kansai.png",
+    ["osaka_evolved"] = "4/41/Kansai_%28Daydream%29.png",
+    ["osaragi"] = "8/88/Somber.png",
+    ["osaragi_evolved"] = "7/76/Somber_%28Buzzsaw%29.png",
+    ["overhaul"] = "b/bf/Restructure.png",
+    ["pain"] = "3/3f/Agony_%28Path%29.png",
+    ["pain_2"] = "3/3f/Agony_%28Path%29.png",
+    ["pain_2_evolved"] = "c/c3/Agony_%28Divine%29.png",
+    ["perona"] = "1/15/Ghost_Lady.png",
+    ["perona_evolved"] = "2/25/Ghost_Lady_%28Princess%29.png",
+    ["piccolo"] = "a/ad/Green_Alien_%28Fusion%29.png",
+    ["piccolo_fused"] = "a/ad/Green_Alien_%28Fusion%29.png",
+    ["piccolo_fused_evolved"] = "7/72/Green_Alien_%28Nameless%29.png",
+    ["pitou"] = "6/63/Cat_Guard.png",
+    ["pitou_evolved"] = "8/8c/Cat_Guard_%28Ballet%29.png",
+    ["poseidon"] = "1/14/Sea_God.png",
+    ["poseidon_evolved"] = "0/07/Sea_God_%28Tyrant_of_the_Seas%29.png",
+    ["power"] = "b/b5/Blood.png",
+    ["power_evolved"] = "5/55/Blood_%28Unleashed%29.png",
+    ["pucci"] = "1/14/Priest.png",
+    ["pucci_cmoon"] = "2/27/Priest_%28New_Moon%29.png",
+    ["pucci_heaven"] = "9/98/Priest_%28Heaven%29.png",
+    ["ragna"] = "0/09/Silver_Slayer.png",
+    ["ragna_evolved"] = "8/8f/Silver_Slayer_%28Hunter%29.png",
+    ["rayleigh"] = "8/8a/Silver_King.png",
+    ["rengoku"] = "9/9b/Donut.png",
+    ["rengoku_evolved"] = "6/65/Donut_%28ABLAZE%29.png",
+    ["renji"] = "3/3d/Renzi.png",
+    ["rias"] = "2/2b/Riony.png",
+    ["rias_evolved"] = "5/52/Riony_%28Devil_Princess%29.png",
+    ["rikka"] = "c/ce/Chuuni.png",
+    ["rikka_evolved"] = "a/a8/Chuuni_%28Delusion%29.png",
+    ["rin_oku"] = "6/63/Blue_Devil.png",
+    ["roger"] = "2/28/Pirate_King.png",
+    ["roger_evolved"] = "9/9e/Pirate_King_%28Final%29.png",
+    ["rohan"] = "5/54/Mangaka.png",
+    ["rohan_evolved"] = "6/65/Mangaka_%28Artist%29.png",
+    ["roshi"] = "c/cc/Turtle_Master.png",
+    ["rukia"] = "b/b0/Snow_Reaper_%28War%29.png",
+    ["rukia_bankai"] = "b/b0/Snow_Reaper_%28War%29.png",
+    ["rukia_bankai_evolved"] = "8/80/Snow_Reaper_%28Final%29.png",
+    ["saber"] = "a/a2/Sword_Queen.png",
+    ["saber_evolved"] = "c/ca/Sword_Queen_%28Knight%29.png",
+    ["sabo"] = "e/e3/Rebel.png",
+    ["sabo_evolved"] = "8/85/Rebel_%28Flame_Ruler%29.png",
+    ["saiki"] = "e/eb/Saickik.png",
+    ["sakamoto"] = "2/20/Legendary_Assassin.png",
+    ["sakamoto_evolved"] = "1/17/Legendary_Assassin_%28Prime%29.png",
+    ["sakura"] = "1/1f/Sakura_Cover.webp",
+    ["sanji"] = "a/aa/Sanji_Cover.webp",
+    ["sasuke"] = "f/fd/Sosuke_Deployment_Card.png",
+    ["sasuke_2"] = "d/d0/Shinobi_%28Hood%29.png",
+    ["sasuke_2_evolved"] = "1/15/Shinobi_%28Storm%29.png",
+    ["sasuke_3"] = "7/75/Shinobi_%28Awakened%29.png",
+    ["sasuke_3_evolved"] = "3/33/Shinobi_%28Eternal%29.png",
+    ["sato"] = "a/a2/Demihuman.png",
+    ["sato_evolved"] = "e/e8/Demihuman_%28Gamer%29.png",
+    ["sayaka"] = "d/d0/Saki.png",
+    ["sayaka_evolved"] = "b/bd/Saki_%28Cyanblade%29.png",
+    ["sengoku_unit"] = "9/9a/Golden_Navy.png",
+    ["sengoku_unit_evolved"] = "9/92/Golden_Navy_%28Buddha%29.png",
+    ["shalltear"] = "e/ed/Bloodcry.png",
+    ["shalltear_evolved"] = "3/3d/Bloodcry_%28Fallen%29.png",
+    ["shanks"] = "8/88/Red_Scar.png",
+    ["shanks_evolved"] = "2/2d/Red_Scar_%28Conqueror%29.png",
+    ["shidou"] = "e/ef/Joker.png",
+    ["shigaraki"] = "1/11/Ashborn.png",
+    ["shigaraki_evolved"] = "f/ff/Ashborn_%28Decay%29.png",
+    ["shisui"] = "9/9d/Shizo.png",
+    ["shisui_evolved"] = "3/33/Shizo_%28Flicker%29.png",
+    ["skull_knight"] = "a/a8/Skeleton_Knight.png",
+    ["skull_knight_evolved"] = "9/91/Skeleton_Knight_%28King%29.png",
+    ["smoker_unit"] = "d/d9/Smoka.png",
+    ["smoker_unit_evolved"] = "8/8d/Smoka_%28Hunter%29.png",
+    ["soifon"] = "f/f8/Wasp.png",
+    ["soifon_evolved"] = "c/c4/Wasp_%28Hornet%29.png",
+    ["sonic"] = "e/e0/Supersound.png",
+    ["sonic_evolved"] = "d/d2/Supersound_%28Speed%29.png",
+    ["speedwagon"] = "d/df/C.E.O..png",
+    ["stain"] = "2/23/Menace.png",
+    ["stain_evolved"] = "3/35/Menace_%28Terror%29.png",
+    ["starlia"] = "a/af/Psychic_Princess.png",
+    ["starlia_evolved"] = "a/af/Psychic_Princess.png",
+    ["starrk"] = "7/70/Jackal.png",
+    ["starrk_evolved"] = "c/c4/Jackal_%28Alpha%29.png",
+    ["sukuna"] = "b/be/Cursed_King.png",
+    ["tanjiro"] = "0/05/Tanji_Deployment_Card.png",
+    ["tatara"] = "1/1a/Tarata.png",
+    ["tatara_evolved"] = "3/38/Tarata_%28Ignite%29.png",
+    ["tatsumaki"] = "7/73/Tamiki.png",
+    ["tatsumaki_evolved"] = "a/aa/Tamiki_%28Tornado%29.png",
+    ["tatsumi"] = "a/aa/Tattermo.png",
+    ["temari"] = "8/80/Fan_Ninja.png",
+    ["tengen"] = "9/91/Tango.png",
+    ["tengen_2"] = "d/dc/Tango_%28Score%29.png",
+    ["tengen_2_evolved"] = "c/ce/Tango_%28Flash_God%29.png",
+    ["thor"] = "4/4c/Lightning_God.png",
+    ["thor_evolved"] = "4/4c/Lightning_God.png",
+    ["todoroki"] = "d/dd/Blaze_Frost.png",
+    ["todoroki_2"] = "d/dd/Blaze_Frost.png",
+    ["todoroki_2_evolved"] = "4/40/Blaze_Frost_%28Released%29.png",
+    ["toji"] = "8/87/Sorcerer_Killer.png",
+    ["toji_evolved"] = "1/17/Sorcerer_Killer_%28Heavenly_Body%29.png",
+    ["toshiro"] = "1/16/Icy_Dragon.png",
+    ["toshiro_evolved"] = "9/91/Icy_Dragon_%28Lotus%29.png",
+    ["tsuna"] = "b/b5/Takamu.png",
+    ["tsuna_evolved"] = "a/a0/Takamu_%28Reborn%29.png",
+    ["ulquiorra"] = "a/a9/Void_Spear.png",
+    ["ulquiorra_evolved"] = "a/a9/Void_Spear.png",
+    ["unohana"] = "b/b2/Bleed_Queen.png",
+    ["uraraka"] = "8/88/Gravity_Hero.png",
+    ["uryu"] = "a/a2/Spirit_Archer.png",
+    ["uryu_evolved"] = "d/dd/Spirit_Archer_%28Reversal%29.png",
+    ["usopp"] = "7/7a/Ussop_Cover.webp",
+    ["usopp_ts"] = "1/1e/Captain_%28Timeskip%29.png",
+    ["usopp_ts_evolved"] = "4/4a/Captain_%28God%29.png",
+    ["vanilla_ice"] = "8/83/Cream.png",
+    ["vanilla_ice_evolved"] = "1/10/Cream_%28Void%29.png",
+    ["vash"] = "c/c2/Gunslinger.png",
+    ["vash_evolved"] = "3/36/Vash_cross.png",
+    ["vegeta"] = "6/6f/Vegeta_Cover.webp",
+    ["vegeta_majin"] = "c/c6/Vego_%28Mage%29.png",
+    ["vegeta_majin_evolved"] = "1/10/Vego_%28Mage_II%29.png",
+    ["vegeta_super"] = "2/2a/Vego_%28Super%29.png",
+    ["vegeta_super_evolved"] = "f/fb/Vego_%28Super_II%29_%28Pose%29.png",
+    ["vegito"] = "5/5c/Fused_Hero_%28Pose%29.png",
+    ["wendy"] = "a/a1/Wind_Dragon_%28Pose%29.png",
+    ["whitebeard"] = "a/ab/Whitehair.png",
+    ["whitebeard_evolved"] = "e/e7/Emperor_Whitehair.png",
+    ["yamamoto"] = "f/f0/Fiery_Commander.png",
+    ["yamamoto_evolved"] = "e/e9/Fiery_Commander_%28Hellfire%29.png",
+    ["yami"] = "d/d8/Black_Blade.png",
+    ["yami_evolved"] = "d/d8/Black_Blade.png",
+    ["yoshino"] = "5/5a/Puppet_Girl.png",
+    ["yoshino_evolved"] = "0/06/Puppet_Girl_%28Spirit%29.png",
+    ["yuma"] = "9/91/Shrimp.png",
+    ["yuma_evolved"] = "9/91/Shrimp.png",
+    ["yuno"] = "6/6d/Elf_Spirit.png",
+    ["yuno_evolved"] = "5/53/Elf_Spirit_%28Wind%29.png",
+    ["yuta"] = "5/52/Mimic_Sorcerer.png",
+    ["yuta_evolved"] = "c/c3/Mimic_Sorcerer_%28Cursed_Child%29.png",
+    ["zabuza"] = "3/3b/Mist_Ninja.png",
+    ["zeke"] = "2/29/Boss_-_The_Yellow_Monkey.png",
+    ["zoro"] = "d/dd/Zoru_Deployment_Card.png",
 }
+
+-- ============================================================================
+-- MODULE: TraitService (Auto Use Trait Reroll Tokens)
+-- Rules:
+--   - Only reroll units with rarity >= Mythic (Exclusive < Mythic < Secret)
+--   - Scan ALL owned units (not just equipped), pick Mythic+ sorted Secret > Mythic
+--   - Stop rolling on a unit if it gets a Mythic-rarity trait (divine/reaper/golden/ethereal/unique)
+--   - If unique trait detected: send webhook notification
+-- Source: TraitRerollUI.lua L93 invoke_server("request_token_trait_reroll", uuid)
+--         trait_reroll_tokens at session.profile_data.trait_reroll_tokens
+--         traits at session.collection.collection_profile_data.owned_units[uuid].traits
+--         Traits data: ReplicatedStorage.src.Data.Traits
+-- ============================================================================
+local TraitService = {}
+
+-- Rarity rank: higher = better. Mirrors UNIT_RARITIES order from GameplaySettings.
+local RARITY_RANK = {
+    Common = 1, Rare = 2, Epic = 3, Legendary = 4,
+    Exclusive = 5, Mythic = 6, Secret = 7,
+}
+local MIN_TRAIT_RARITY_RANK = RARITY_RANK["Mythic"] -- only Mythic and Secret units eligible
+
+-- Trait data from ReplicatedStorage.src.Data.Traits
+-- rarity: Rare < Legendary < Mythic. Stop rolling when unit has any Mythic-rarity trait.
+local TRAIT_INFO = {
+    superior      = { name = "Superior",  rarity = "Rare" },
+    range         = { name = "Range",     rarity = "Rare" },
+    nimble        = { name = "Nimble",    rarity = "Rare" },
+    culling       = { name = "Culling",   rarity = "Legendary" },
+    neuroplasticity = { name = "Adept",   rarity = "Legendary" },
+    sniper        = { name = "Sniper",    rarity = "Legendary" },
+    godspeed      = { name = "Godspeed",  rarity = "Legendary" },
+    reaper        = { name = "Reaper",    rarity = "Mythic" },
+    golden        = { name = "Golden",    rarity = "Mythic" },
+    divine        = { name = "Divine",    rarity = "Mythic" },
+    ethereal      = { name = "Celestial", rarity = "Mythic" },
+    unique        = { name = "Unique",    rarity = "Mythic" },
+}
+local TRAIT_RARITY_RANK = { Rare = 1, Legendary = 2, Mythic = 3 }
+
+-- Returns true if traits table contains any Mythic-rarity trait (stop condition)
+local function HasMythicTrait(traits)
+    if type(traits) ~= "table" then return false, nil end
+    for _, t in ipairs(traits) do
+        local info = TRAIT_INFO[t.trait]
+        if info and (TRAIT_RARITY_RANK[info.rarity] or 0) >= TRAIT_RARITY_RANK["Mythic"] then
+            return true, t.trait
+        end
+    end
+    return false, nil
+end
+
+-- Returns true if traits table contains "unique" specifically
+local function HasUniqueTrait(traits)
+    if type(traits) ~= "table" then return false end
+    for _, t in ipairs(traits) do
+        if t.trait == "unique" then return true end
+    end
+    return false
+end
+
+-- Format traits for logging: "Unique(Mythic) + Sniper(Legendary)"
+local function FormatTraits(traits)
+    if type(traits) ~= "table" or #traits == 0 then return "none" end
+    local parts = {}
+    for _, t in ipairs(traits) do
+        local info = TRAIT_INFO[t.trait]
+        local name = info and info.name or t.trait
+        local rar  = info and info.rarity or "?"
+        table.insert(parts, string.format("%s(%s)", name, rar))
+    end
+    return table.concat(parts, " + ")
+end
+
+function TraitService:GetTokenCount()
+    local session = GameModules.Session
+    if not session or not session.profile_data then return 0 end
+    local n = session.profile_data.trait_reroll_tokens
+    return (type(n) == "number") and n or 0
+end
+
+-- Returns unit's current traits table (or nil)
+function TraitService:GetUnitTraits(uuid)
+    local session = GameModules.Session
+    if not session or not session.collection then return nil end
+    local unit = session.collection.collection_profile_data.owned_units[uuid]
+    return unit and unit.traits
+end
+
+-- Check if traits list contains "unique"
+function TraitService:HasUniqueTrait(traits)
+    return HasUniqueTrait(traits)
+end
+
+-- Get unit rarity rank from Units data
+function TraitService:GetUnitRarityRank(unit_id)
+    local unitDef = GameModules.Units and GameModules.Units[unit_id]
+    if not unitDef then return 0 end
+    return RARITY_RANK[unitDef.rarity] or 0
+end
+
+-- Build list of eligible uuid from ALL owned units (Mythic+ rarity)
+-- Sorted by rarity DESC (Secret first), then pick the best one to reroll
+-- TraitRerollTargetUnits whitelist applies if set
+function TraitService:GetEligibleUuids()
+    local session = GameModules.Session
+    if not session or not session.collection then return {} end
+    local cpd = session.collection.collection_profile_data
+    local owned = cpd and cpd.owned_units
+    if type(owned) ~= "table" then return {} end
+
+    local targets = Config.TraitRerollTargetUnits
+    local hasTargetFilter = type(targets) == "table" and #targets > 0
+
+    local targetSet = {}
+    if hasTargetFilter then
+        for _, tid in ipairs(targets) do targetSet[tid] = true end
+    end
+
+    local result = {}
+    for uuid, unit in pairs(owned) do
+        if type(unit) == "table" then
+            local rank = self:GetUnitRarityRank(unit.unit_id)
+            if rank >= MIN_TRAIT_RARITY_RANK then
+                if not hasTargetFilter or targetSet[unit.unit_id] then
+                    table.insert(result, {uuid = uuid, rank = rank, unit_id = unit.unit_id})
+                end
+            end
+        end
+    end
+
+    -- sort: Secret > Mythic, same rarity = keep stable order
+    table.sort(result, function(a, b) return a.rank > b.rank end)
+
+    local uuids = {}
+    for _, entry in ipairs(result) do
+        table.insert(uuids, entry.uuid)
+    end
+    return uuids
+end
+
+-- Send webhook when unique trait rolled
+function TraitService:NotifyUnique(uuid)
+    local session = GameModules.Session
+    local unit = session and session.collection
+        and session.collection.collection_profile_data.owned_units[uuid]
+    if not unit then return end
+
+    local unitDef = GameModules.Units and GameModules.Units[unit.unit_id]
+    local unitName = (unitDef and unitDef.name) or unit.unit_id
+    local rarity = (unitDef and unitDef.rarity) or "?"
+
+    WebhookService:SendUnitNotification(unit, string.format("[UNIQUE TRAIT 0.1%%] %s (%s)", unitName, rarity))
+end
+
+function TraitService:UseTokens()
+    if not Config.AutoUseTrait then return end
+    if not GameModules.Loader or not GameModules.Loader.IsLobby then return end
+
+    local tokens = self:GetTokenCount()
+    local keep = tonumber(Config.MaxTraitTokensToKeep) or 0
+    local toUse = tokens - keep
+
+    if toUse <= 0 then
+        log("TraitService: tokens=" .. tokens .. " keep=" .. keep .. " skip")
+        return
+    end
+
+    local uuids = self:GetEligibleUuids()
+    if #uuids == 0 then
+        log("TraitService: no Mythic+ units in collection eligible for reroll")
+        return
+    end
+
+    log(string.format("TraitService: %d tokens to use, %d Mythic+ units eligible (Secret-first order)", toUse, #uuids))
+
+    local used = 0
+    local idx = 1
+    while used < toUse do
+        -- skip units that already have a Mythic-rarity trait (stop condition)
+        local skipped = 0
+        while skipped < #uuids do
+            local currentTraits = self:GetUnitTraits(uuids[idx])
+            local hasMythic, mythicId = HasMythicTrait(currentTraits)
+            if hasMythic then
+                local info = TRAIT_INFO[mythicId]
+                log(string.format("TraitService: %s already has %s trait, skipping",
+                    uuids[idx], info and info.name or mythicId))
+                idx = idx + 1
+                if idx > #uuids then idx = 1 end
+                skipped = skipped + 1
+            else
+                break
+            end
+        end
+        if skipped >= #uuids then
+            log("TraitService: all eligible units already have Mythic-rarity trait, stopping")
+            break
+        end
+
+        local uuid = uuids[idx]
+
+        -- snapshot traits before reroll
+        local traitsBefore = self:GetUnitTraits(uuid)
+
+        local ok, err = pcall(function()
+            GameModules:InvokeServer("request_token_trait_reroll", uuid)
+        end)
+
+        if not ok then
+            log("TraitService: reroll error uuid=" .. uuid .. " err=" .. tostring(err))
+            task.wait(1)
+        else
+            used = used + 1
+            -- wait for server to update traits
+            task.wait(0.8)
+
+            local traitsAfter = self:GetUnitTraits(uuid)
+            local traitStr = FormatTraits(traitsAfter)
+            log(string.format("TraitService: rolled -> %s (token %d/%d)", traitStr, used, toUse))
+
+            -- Push trait roll event to Tracker
+            if TrackerService and TrackerService.PushTrait and type(traitsAfter) == "table" then
+                local unitId = nil
+                local session = GameModules.Session
+                if session and session.collection and session.collection.collection_profile_data then
+                    local unit = session.collection.collection_profile_data.owned_units[uuid]
+                    if unit then unitId = unit.unit_id end
+                end
+                for _, t in ipairs(traitsAfter) do
+                    local tid = t.trait
+                    local info = TRAIT_INFO[tid] or {}
+                    local tName = info.name or tid
+                    local tRarity = info.rarity or "Rare"
+                    local isUniq = (tid == "unique")
+                    pcall(function()
+                        TrackerService:PushTrait({
+                            unit_id = unitId,
+                            uuid = uuid,
+                            trait_id = tid,
+                            trait_name = tName,
+                            trait_rarity = tRarity,
+                            is_unique = isUniq,
+                        })
+                    end)
+                end
+            end
+
+            -- check if unique specifically
+            if HasUniqueTrait(traitsAfter) and not HasUniqueTrait(traitsBefore) then
+                log("TraitService: *** UNIQUE TRAIT (0.1%) on " .. uuid .. " ***")
+                pcall(function() self:NotifyUnique(uuid) end)
+            end
+
+            -- if Mythic-rarity trait landed, move to next unit
+            local hasMythicNow = HasMythicTrait(traitsAfter)
+            if hasMythicNow then
+                log("TraitService: Mythic trait on this unit, moving to next")
+                idx = idx + 1
+                if idx > #uuids then idx = 1 end
+            end
+        end
+
+        task.wait(0.4)
+    end
+
+    log("TraitService: done, used=" .. used .. " tokens")
+end
+
+-- ============================================================================
+-- MODULE: SellService (Auto Sell Junk Units When Inventory Full)
+-- Source ref: CollectionUI.lua L408: invoke_server("sell_units", u10) -- u10 = array of uuid strings
+--             UnitCollection.lua L36: size() = table_size(owned_units)
+--             UNIT_RARITIES in GameplaySettings = ['Common','Rare','Epic','Legendary','Exclusive','Mythic','Secret']
+-- ============================================================================
+local SellService = {}
+
+function SellService:GetCollectionSize()
+    local session = GameModules.Session
+    if not session or not session.collection then return 0, 250 end
+    local cpd = session.collection.collection_profile_data
+    -- capacity is live-updated via on_capacity_changed (UnitCollectionServiceClient.lua L157)
+    local capacity = cpd and cpd.capacity
+    if not capacity or capacity <= 0 then
+        capacity = tonumber(Config.AutoSellCapacity) or 250
+    end
+    local count = 0
+    local owned = cpd and cpd.owned_units
+    if type(owned) == "table" then
+        for _ in pairs(owned) do count = count + 1 end
+    end
+    return count, capacity
+end
+
+function SellService:CollectSellableUuids()
+    local session = GameModules.Session
+    if not session or not session.collection then return {} end
+    local owned = session.collection.collection_profile_data
+        and session.collection.collection_profile_data.owned_units
+    if type(owned) ~= "table" then return {} end
+
+    local equipped = session.collection.collection_profile_data.equipped_units or {}
+    -- build equipped uuid set for O(1) lookup
+    local equippedSet = {}
+    for _, uuid in pairs(equipped) do
+        equippedSet[uuid] = true
+    end
+
+    local sellRarities = (type(Config.AutoSellRarities) == "table") and Config.AutoSellRarities or {}
+    local sellList = {}
+
+    for uuid, unit in pairs(owned) do
+        if type(unit) ~= "table" then continue end
+
+        -- skip locked units if configured
+        if Config.AutoSellKeepLocked and unit._locked then continue end
+
+        -- skip equipped units if configured
+        if Config.AutoSellKeepEquipped and equippedSet[uuid] then continue end
+
+        -- check rarity
+        local unitDef = GameModules.Units and GameModules.Units[unit.unit_id]
+        local rarity = unitDef and unitDef.rarity
+        if rarity and sellRarities[rarity] then
+            table.insert(sellList, uuid)
+        end
+    end
+
+    return sellList
+end
+
+function SellService:SellJunk()
+    if not Config.AutoSellEnabled then
+        return
+    end
+
+    local count, capacity = self:GetCollectionSize()
+    local threshold = tonumber(Config.AutoSellThreshold) or 0.85
+    local ratio = (capacity > 0) and (count / capacity) or 0
+
+    if ratio < threshold then
+        log(string.format("SellService: inventory %d/%d (%.0f%%) below threshold %.0f%%, skipping",
+            count, capacity, ratio * 100, threshold * 100))
+        return
+    end
+
+    log(string.format("SellService: inventory %d/%d (%.0f%%) >= threshold, collecting sellable units",
+        count, capacity, ratio * 100))
+
+    local toSell = self:CollectSellableUuids()
+    if #toSell == 0 then
+        log("SellService: no sellable units found (check AutoSellRarities config)")
+        return
+    end
+
+    log("SellService: selling " .. #toSell .. " units")
+
+    -- sell in batches of 50 (safe limit)
+    local BATCH = 50
+    local sold = 0
+    for i = 1, #toSell, BATCH do
+        local batch = {}
+        for j = i, math.min(i + BATCH - 1, #toSell) do
+            table.insert(batch, toSell[j])
+        end
+        local ok, err = pcall(function()
+            GameModules:InvokeServer("sell_units", batch)
+        end)
+        if ok then
+            sold = sold + #batch
+            log("SellService: sold batch " .. #batch .. " (total=" .. sold .. ")")
+            if TrackerService and TrackerService.PushSell then
+                pcall(function()
+                    TrackerService:PushSell(#batch, batch)
+                end)
+            end
+        else
+            log("SellService: sell_units error: " .. tostring(err))
+        end
+        task.wait(0.5)
+    end
+
+    log("SellService: done, sold " .. sold .. " units")
+end
 
 -- ============================================================================
 -- MAIN ENTRY POINT
@@ -3012,6 +4873,7 @@ local Main = {
     GameModules = GameModules,
     UnitImages = UnitImages,
     WebhookService = WebhookService,
+    TrackerService = TrackerService,
     JoinStart = JoinStart,
     DailyService = DailyService,
     CodeService = CodeService,
@@ -3020,11 +4882,16 @@ local Main = {
     AntiAfkService = AntiAfkService,
     PerformanceService = PerformanceService,
     KaitunUIService = KaitunUIService,
+    TraitService = TraitService,
+    SellService = SellService,
 }
 
 function Main:Start()
     self.KaitunUIService:Create()
     self.AntiAfkService:Start()
+    if self.TrackerService and self.TrackerService.Start then
+        self.TrackerService:Start()
+    end
 
     local ok = self.JoinStart:Run()
     if not ok then
@@ -3036,8 +4903,10 @@ function Main:Start()
     self.FarmService:SetupTeleportAutoReload()
 
     if GameModules.Loader.IsLobby then
-        self.DailyService:ClaimAll()
+        self.DailyService:ClaimAll()   -- claim daily, calendar, milestones, completed quests
         self.CodeService:RedeemAll()
+        self.SellService:SellJunk()    -- sell junk before summon to free space
+        self.TraitService:UseTokens()  -- use trait tokens on equipped units
 
         if self.FarmService:ShouldFarm() then
             self.FarmService:EnterStoryMatch()
