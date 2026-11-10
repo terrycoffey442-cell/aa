@@ -1221,38 +1221,40 @@ function JoinStart:EnsureStarterUnitEquipped()
         return true
     end
 
-    if session.profile_data and session.profile_data._FIRST_LOAD then
+    for retry = 1, 5 do
         pcall(function()
             GameModules:InvokeServer("equip_first_units")
         end)
-        task.wait(0.25)
-    end
+        task.wait(0.35)
 
-    if session.collection:get_used_equipped_slots() > 0 then
-        log("Equipped starter unit via equip_first_units")
-        return true
-    end
-
-    local targetUuid = self:GetStarterUnitUUID()
-    if not targetUuid then
-        warn("[Main] No owned unit found to equip")
-        return false
-    end
-
-    log("Equipping unit UUID: " .. tostring(targetUuid))
-    pcall(function()
-        GameModules:InvokeServer("equip_unit", targetUuid)
-    end)
-
-    local startClock = os.clock()
-    while os.clock() - startClock < 3 do
         if session.collection:get_used_equipped_slots() > 0 then
-            log("Unit equipped successfully")
+            log("Equipped starter unit via equip_first_units")
             return true
         end
-        task.wait(0.1)
+
+        local targetUuid = self:GetStarterUnitUUID()
+        if targetUuid then
+            log("Equipping unit UUID: " .. tostring(targetUuid))
+            pcall(function()
+                GameModules:InvokeServer("equip_unit", targetUuid, "1")
+            end)
+            task.wait(0.25)
+            if session.collection:get_used_equipped_slots() == 0 then
+                pcall(function()
+                    GameModules:InvokeServer("equip_unit", targetUuid)
+                end)
+                task.wait(0.25)
+            end
+            if session.collection:get_used_equipped_slots() > 0 then
+                log("Unit equipped successfully")
+                return true
+            end
+        else
+            task.wait(0.5)
+        end
     end
 
+    warn("[Main] Failed to equip starter unit after retries")
     return session.collection:get_used_equipped_slots() > 0
 end
 
@@ -1956,19 +1958,68 @@ function FarmService:ShouldFarm()
     return playerLevel < targetLevel
 end
 
-function FarmService:FindEmptyStoryLobby()
+function FarmService:LeaveOwnedStoryLobbies()
+    local localPlayer = Players.LocalPlayer
     local lobbiesRoot = workspace:FindFirstChild("_LOBBIES")
     local storyFolder = lobbiesRoot and lobbiesRoot:FindFirstChild("Story")
+    if storyFolder then
+        for _, model in ipairs(storyFolder:GetChildren()) do
+            local owner = model:FindFirstChild("Owner") and model.Owner.Value
+            local playersFolder = model:FindFirstChild("Players")
+            local inPlayers = false
+            if playersFolder and localPlayer then
+                for _, pVal in ipairs(playersFolder:GetChildren()) do
+                    if (pVal:IsA("ObjectValue") and pVal.Value == localPlayer) or pVal.Name == localPlayer.Name then
+                        inPlayers = true
+                        break
+                    end
+                end
+            end
+            if owner == localPlayer or inPlayers then
+                pcall(function()
+                    GameModules:InvokeServer("request_leave_lobby", model.Name)
+                end)
+                task.wait(0.2)
+            end
+        end
+    end
+
+    local lobbySvc = GameModules.LobbyServiceClient
+    if lobbySvc and lobbySvc.current_lobby then
+        pcall(function()
+            GameModules:InvokeServer("request_leave_lobby", lobbySvc.current_lobby)
+        end)
+        lobbySvc.current_lobby = nil
+        lobbySvc.current_lobby_model = nil
+        task.wait(0.2)
+    end
+end
+
+function FarmService:FindEmptyStoryLobby()
+    local lobbiesRoot = workspace:FindFirstChild("_LOBBIES")
+    if not lobbiesRoot then
+        lobbiesRoot = workspace:WaitForChild("_LOBBIES", 10)
+    end
+    local storyFolder = lobbiesRoot and (lobbiesRoot:FindFirstChild("Story") or lobbiesRoot:WaitForChild("Story", 10))
     if not storyFolder then
         return nil
     end
 
+    local candidates = {}
     for _, model in ipairs(storyFolder:GetChildren()) do
         local owner = model:FindFirstChild("Owner") and model.Owner.Value
         local active = model:FindFirstChild("Active") and model.Active.Value
-        if not owner and not active then
-            return model
+        local locked = model:FindFirstChild("Locked") and model.Locked.Value
+        local teleporting = model:FindFirstChild("Teleporting") and model.Teleporting.Value
+        local playersFolder = model:FindFirstChild("Players")
+        local playerCount = playersFolder and #playersFolder:GetChildren() or 0
+        if not owner and not active and not locked and not teleporting and playerCount == 0 then
+            table.insert(candidates, model)
         end
+    end
+
+    if #candidates > 0 then
+        return candidates[math.random(1, #candidates)]
     end
 
     return nil
@@ -2779,26 +2830,42 @@ function FarmService:EnterStoryMatch()
     local targetLevel = tonumber(Config.TargetFarmLevel) or 20
     log(string.format("Player Level (%d) < TargetFarmLevel (%d), entering Story match", playerLevel, targetLevel))
 
-    self:EquipBestTeam()
-
     local targetWorld = Config.FarmWorld or "namek"
-    local targetStage, isFirstClearProgression = self:GetDesiredStoryStage(targetWorld)
     local difficulty = Config.FarmDifficulty or "Normal"
-    log(string.format("Selected Story stage: %s (mode=%s)", targetStage, isFirstClearProgression and "FirstClearAct1..6" or "ReplayAct1"))
+    local localPlayer = Players.LocalPlayer
+    local attempt = 0
 
-    for attempt = 1, 10 do
+    while self:ShouldFarm() and GameModules.Loader and GameModules.Loader.IsLobby do
+        attempt = attempt + 1
+
+        -- 1. Ensure at least 1 unit is equipped (server rejects lock/start if 0 equipped)
+        self:EquipBestTeam()
+        local session = GameModules.Session
+        local eqSlots = session and session.collection and session.collection:get_used_equipped_slots() or 0
+        if eqSlots == 0 and JoinStart and JoinStart.EnsureStarterUnitEquipped then
+            JoinStart:EnsureStarterUnitEquipped()
+        end
+
+        -- 2. Clear any stale lobby state if AlreadyInLobby is stuck
+        self:LeaveOwnedStoryLobbies()
+
+        local targetStage, isFirstClearProgression = self:GetDesiredStoryStage(targetWorld)
         local lobbyModel = self:FindEmptyStoryLobby()
+
         if lobbyModel then
-            log(string.format("Joining Story lobby: %s (Attempt %d)", lobbyModel.Name, attempt))
+            log(string.format("Joining Story lobby: %s -> %s (mode=%s, Attempt %d)",
+                lobbyModel.Name, targetStage, isFirstClearProgression and "FirstClearAct1..6" or "ReplayAct1", attempt))
+
             local joined = false
             pcall(function()
                 joined = GameModules:InvokeServer("request_join_lobby", lobbyModel.Name) == true
             end)
 
-            if joined then
+            local isOwner = lobbyModel:FindFirstChild("Owner") and lobbyModel.Owner.Value == localPlayer
+            if joined and isOwner then
                 task.wait(0.2)
 
-                -- Close any World Skip UI popup if open (never accept World Skip when ClearWorldActsFirst is active)
+                -- Close any World Skip UI popup if open
                 local guiService = GameModules.GUIService
                 if guiService and guiService.notification_windows_ui then
                     pcall(function()
@@ -2815,34 +2882,64 @@ function FarmService:EnterStoryMatch()
                     task.wait(1.5)
                 end
 
-                -- Lock desired stage + start game
+                -- 3. Lock desired stage; if rejected, walk backwards Act N -> Act 1 to find highest unlocked stage
                 local locked = false
+                local lockedStage = targetStage
                 pcall(function()
                     locked = GameModules:InvokeServer("request_lock_level", lobbyModel.Name, targetStage, true, difficulty) == true
                 end)
 
-                if not locked and targetStage ~= "namek_level_1" then
-                    pcall(function()
-                        locked = GameModules:InvokeServer("request_lock_level", lobbyModel.Name, "namek_level_1", true, difficulty) == true
-                    end)
+                if not locked then
+                    local curW, curActStr = string.match(tostring(targetStage), "^([%w_]+)_level_(%d+)$")
+                    local startAct = (tonumber(curActStr) or 6) - 1
+                    local worldPrefix = curW or targetWorld
+                    for fallbackAct = startAct, 1, -1 do
+                        local fallbackStage = string.format("%s_level_%d", worldPrefix, fallbackAct)
+                        pcall(function()
+                            locked = GameModules:InvokeServer("request_lock_level", lobbyModel.Name, fallbackStage, true, difficulty) == true
+                        end)
+                        if locked then
+                            lockedStage = fallbackStage
+                            log(string.format("Fallback locked highest unlocked stage: %s", lockedStage))
+                            break
+                        end
+                    end
                 end
 
                 if locked then
                     task.wait(0.2)
-                    log("Starting Story match via request_start_game")
+                    log(string.format("Starting Story match (%s) via request_start_game", tostring(lockedStage)))
                     pcall(function()
                         GameModules:InvokeServer("request_start_game", lobbyModel.Name)
                     end)
+
+                    -- 4. Wait up to 15s for Roblox teleport to occur; if TeleportService drops/fails, leave pod and retry!
+                    local waitStart = os.clock()
+                    while os.clock() - waitStart < 15 do
+                        task.wait(0.5)
+                        if not GameModules.Loader or not GameModules.Loader.IsLobby then
+                            return true
+                        end
+                    end
+                    warn("[Main] Teleport did not complete within 15s, leaving lobby pod and retrying")
+                else
+                    warn(string.format("[Main] request_lock_level failed on %s, leaving pod and retrying", lobbyModel.Name))
                 end
 
-                return true
+                pcall(function()
+                    GameModules:InvokeServer("request_leave_lobby", lobbyModel.Name)
+                end)
+            elseif joined and not isOwner then
+                pcall(function()
+                    GameModules:InvokeServer("request_leave_lobby", lobbyModel.Name)
+                end)
             end
         end
-        task.wait(1)
+
+        task.wait(1.5)
     end
 
-    warn("[Main] Failed to find or join an empty Story lobby")
-    return false
+    return true
 end
 
 function FarmService:EnableAutoSkipSetting()
