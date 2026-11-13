@@ -76,8 +76,8 @@ local Config = {
     AutoReloadOnTeleport = true, -- Automatically re-run script across Lobby <-> Match / Replay teleports
     TargetFarmLevel = 40, -- Set custom min_level here (e.g. 10, 20, 50)
     FarmWorld = "namek", -- Planet Greenie
-    FarmLevel = "namek_level_1", -- Act 1 (fastest Replay stage after Act 1..6 First Clear)
-    ClearWorldActsFirst = true, -- Clear Act 1 -> Act 6 sequentially first (+360 First Clear Gems), then return to Lobby & Replay Act 1
+    FarmLevel = "namek_level_1", -- Act 1 (fastest Replay stage)
+    ClearWorldActsFirst = false, -- false = Farm directly FarmLevel (Act 1), do not clear Act 1..6 first
     FarmDifficulty = "Normal",
     UseWorldSkip = false, -- Keep false so Act 1..5 First Clear gems (+300 Gems) are not skipped
     AutoVoteStart = true,
@@ -2950,12 +2950,12 @@ function FarmService:EnableAutoSkipSetting()
     local player = Players.LocalPlayer
     local settingsFolder = player and player:FindFirstChild("_settings")
     local autoSkipVal = settingsFolder and settingsFolder:FindFirstChild("autoskip_waves")
-    if autoSkipVal and not autoSkipVal.Value then
+    if autoSkipVal then
         pcall(function()
             autoSkipVal.Value = true
             GameModules:InvokeServer("toggle_setting", "autoskip_waves", true)
         end)
-        log("Enabled autoskip_waves setting")
+        log("Enabled autoskip_waves setting (Always True)")
     end
 
     local guiService = GameModules.GUIService
@@ -2966,11 +2966,15 @@ function FarmService:EnableAutoSkipSetting()
         end
         voteWaveUI.on_start_vote_wave_skip = function(uiSelf, ...)
             if Config.AutoSkipWaves then
-                local waveNum = (workspace:FindFirstChild("_wave_num") and tonumber(workspace._wave_num.Value)) or 0
                 local p = Players.LocalPlayer
                 if p and p:FindFirstChild("_settings") and p._settings:FindFirstChild("autoskip_waves") then
-                    p._settings.autoskip_waves.Value = (waveNum <= 9)
+                    p._settings.autoskip_waves.Value = true
                 end
+                task.spawn(function()
+                    pcall(function()
+                        GameModules:InvokeServer("vote_wave_skip")
+                    end)
+                end)
             end
             return voteWaveUI._orig_on_start_vote_wave_skip(uiSelf, ...)
         end
@@ -3046,32 +3050,29 @@ function FarmService:RunInGame()
                 end
             end
 
-            -- 2. Smart Wave Skip (instant on Waves 1..9, and on Waves 10..15 when alive enemies <= 2)
+            -- 2. Wave Skip (Always True in settings + instant vote_wave_skip on all waves 1..15)
             if Config.AutoSkipWaves and gameStarted and not gameFinished then
-                local waveNum = (workspace:FindFirstChild("_wave_num") and tonumber(workspace._wave_num.Value)) or 0
                 local p = Players.LocalPlayer
                 if p and p:FindFirstChild("_settings") and p._settings:FindFirstChild("autoskip_waves") then
-                    p._settings.autoskip_waves.Value = (waveNum <= 9)
+                    if not p._settings.autoskip_waves.Value then
+                        p._settings.autoskip_waves.Value = true
+                        pcall(function()
+                            GameModules:InvokeServer("toggle_setting", "autoskip_waves", true)
+                        end)
+                    end
                 end
 
                 local voteWaveUI = guiService and guiService.vote_wave_ui
                 if voteWaveUI and voteWaveUI.screenGUI and voteWaveUI.screenGUI.Enabled then
-                    if os.clock() - lastVoteSkip >= 0.35 then
-                        local canSkipNow = (waveNum <= 9)
-                        if not canSkipNow then
-                            local aliveEnemies = self:GetAliveEnemies()
-                            canSkipNow = (#aliveEnemies <= 2)
-                        end
-                        if canSkipNow then
-                            lastVoteSkip = os.clock()
-                            task.spawn(function()
-                                pcall(function()
-                                    if GameModules:InvokeServer("vote_wave_skip") then
-                                        voteWaveUI.screenGUI.Enabled = false
-                                    end
-                                end)
+                    if os.clock() - lastVoteSkip >= 0.3 then
+                        lastVoteSkip = os.clock()
+                        task.spawn(function()
+                            pcall(function()
+                                if GameModules:InvokeServer("vote_wave_skip") then
+                                    voteWaveUI.screenGUI.Enabled = false
+                                end
                             end)
-                        end
+                        end)
                     end
                 end
             end
@@ -3112,15 +3113,17 @@ function FarmService:RunInGame()
                     task.wait(0.35)
 
                     local isVictory = false
-                    local baseHum = workspace:FindFirstChild("_BASES")
-                        and workspace._BASES:FindFirstChild("player")
-                        and workspace._BASES.player:FindFirstChild("base")
-                        and workspace._BASES.player.base:FindFirstChild("fake_unit")
-                        and workspace._BASES.player.base.fake_unit:FindFirstChildOfClass("Humanoid")
-                    if baseHum then
-                        isVictory = (baseHum.Health > 0)
-                    elseif resultsUI and resultsUI.settings and resultsUI.settings.victory ~= nil then
+                    if resultsUI and resultsUI.settings and resultsUI.settings.victory ~= nil then
                         isVictory = (resultsUI.settings.victory == true)
+                    else
+                        local baseHum = workspace:FindFirstChild("_BASES")
+                            and workspace._BASES:FindFirstChild("player")
+                            and workspace._BASES.player:FindFirstChild("base")
+                            and workspace._BASES.player.base:FindFirstChild("fake_unit")
+                            and workspace._BASES.player.base.fake_unit:FindFirstChildOfClass("Humanoid")
+                        if baseHum then
+                            isVictory = (baseHum.Health > 0)
+                        end
                     end
                     local resultStr = isVictory and "Victory" or "Defeat"
 
