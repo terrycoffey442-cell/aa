@@ -74,7 +74,7 @@ local Config = {
     AutoPlaceAndUpgrade = true, -- Auto place equipped units near enemy spawn + auto upgrade + auto active skill to WIN
     AutoEquipBestTeam = true, -- Automatically fill all unlocked unit slots with strongest owned units
     AutoReloadOnTeleport = true, -- Automatically re-run script across Lobby <-> Match / Replay teleports
-    TargetFarmLevel = 40, -- Set custom min_level here (e.g. 10, 20, 50)
+    TargetFarmLevel = 50, -- Set custom min_level here (e.g. 10, 20, 50)
     FarmWorld = "namek", -- Planet Greenie
     FarmLevel = "namek_level_1", -- Act 1 (fastest Replay stage)
     ClearWorldActsFirst = false, -- false = Farm directly FarmLevel (Act 1), do not clear Act 1..6 first
